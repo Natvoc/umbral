@@ -1,0 +1,9 @@
+# Normaliza los saltos de línea a LF en el repositorio y en la copia de trabajo,
+# para que el repo sea igual en Windows, macOS y Linux.
+* text=auto eol=lf
+
+# Binarios: sin conversión ni diffs de texto.
+*.pt binary
+*.png binary
+*.npy binary
+*.npz binary

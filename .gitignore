@@ -10,3 +10,18 @@ dist/
 # Salida de experimentos
 runs/*
 !runs/.gitkeep
+
+# Secretos y configuración local
+.env
+.env.*
+.claude/settings.local.json
+
+# Editores y sistema operativo
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Checkpoints guardados fuera de runs/
+*.pt
