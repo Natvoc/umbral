@@ -1,0 +1,12 @@
+# Entornos y cachés
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Salida de experimentos
+runs/*
+!runs/.gitkeep

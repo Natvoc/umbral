@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "umbral"
+version = "0.0.1"
+description = "Research testbed: embodied self-models in small agents trained from scratch, and what happens when the body is removed."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0,<2.4",  # 2.5.x numpy.random DLLs are blocked by Windows Smart App Control on the dev laptop
+    "torch",  # CPU build: install first from https://download.pytorch.org/whl/cpu
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+umbral = "umbral.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,20 @@
+# Base configuration. Every key that can be overridden from the CLI must exist here.
+seed: 0
+experiment: noop
+
+run:
+  name: base
+  output_dir: runs
+  resume_from: null   # path to a checkpoint .pt to resume from
+
+torch:
+  num_threads: 4          # intra-op threads; keeps the laptop usable
+  num_interop_threads: 1  # can only be set once per process
+
+noop:
+  steps: 200
+  checkpoint_at: 100
+  batch_size: 32
+  in_dim: 8
+  hidden: 16
+  lr: 0.01
