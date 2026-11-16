@@ -98,6 +98,11 @@ class Recorder:
         text = json.dumps(self.meta, indent=2, ensure_ascii=False)
         (self.run_dir / "meta.json").write_text(text + "\n", encoding="utf-8")
 
+    def update_meta(self, **values: Any) -> None:
+        """Add or replace fields in meta.json (written immediately)."""
+        self.meta.update(values)
+        self._write_meta()
+
     def log_metric(self, step: int, name: str, value: float) -> None:
         line = json.dumps({"step": int(step), "name": name, "value": float(value)})
         self._metrics.write(line + "\n")

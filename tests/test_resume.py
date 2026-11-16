@@ -21,3 +21,15 @@ def test_resume_ignores_current_seed(run_noop):
     ckpt = checkpoint_path(full, 100).as_posix()
     resumed = run_noop("seed=99", f"run.resume_from={ckpt}")
     assert read_metrics(resumed) == [l for l in read_metrics(full) if json.loads(l)["step"] > 100]
+
+
+def test_meta_records_seed_override(run_noop):
+    full = run_noop("seed=3")
+    meta_full = json.loads((full / "meta.json").read_text(encoding="utf-8"))
+    assert meta_full["seed_overridden_by_checkpoint"] is False
+
+    ckpt = checkpoint_path(full, 100).as_posix()
+    resumed = run_noop("seed=99", f"run.resume_from={ckpt}")
+    meta = json.loads((resumed / "meta.json").read_text(encoding="utf-8"))
+    assert meta["seed_overridden_by_checkpoint"] is True
+    assert meta["seed"] == 99  # the configured seed is still recorded, just not used

@@ -24,6 +24,8 @@ def run_experiment(config: Config) -> Path:
         "threads": seeded.threads.as_dict(),
         "resumed_from": None if resume is None else str(resume_from),
         "resumed_at_step": None if resume is None else resume.step,
+        # On resume the checkpoint's RNG state replaces the one derived from config.seed.
+        "seed_overridden_by_checkpoint": resume is not None,
     }
     with Recorder(config, meta=meta) as recorder:
         experiment(config, recorder, seeded.np_rng, resume)

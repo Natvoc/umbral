@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=2.0,<2.4",  # 2.5.x numpy.random DLLs are blocked by Windows Smart App Control on the dev laptop
     "torch",  # CPU build: install first from https://download.pytorch.org/whl/cpu
     "pyyaml",
+    "matplotlib",  # viewer (GIF via Pillow, which matplotlib already depends on)
 ]
 
 [project.optional-dependencies]

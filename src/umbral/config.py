@@ -107,9 +107,18 @@ def apply_overrides(data: dict[str, Any], overrides: Iterable[str]) -> dict[str,
     return data
 
 
+def _str_keys(value: Any) -> Any:
+    """Make every mapping key a string (YAML ``0:`` keys become ``"0"``)."""
+    if isinstance(value, dict):
+        return {str(k): _str_keys(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_str_keys(v) for v in value]
+    return value
+
+
 def load_config(path: str | Path, overrides: Iterable[str] = ()) -> Config:
     with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
         raise ValueError(f"{path}: top level must be a mapping")
-    return Config(apply_overrides(data, overrides))
+    return Config(apply_overrides(_str_keys(data), overrides))

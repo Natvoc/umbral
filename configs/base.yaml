@@ -18,3 +18,102 @@ noop:
   in_dim: 8
   hidden: 16
   lr: 0.01
+
+# ----------------------------------------------------------------------------
+# Phase 1: world and body. Units: arena units and simulation steps (no dt).
+# ----------------------------------------------------------------------------
+world:
+  size: 10.0                    # square arena side
+  history_id: 0                 # key into world.histories
+  max_steps: 0                  # >0 sets `truncated` after that many env steps; 0 = never
+  freeze_when_disembodied: true # pause world and physical body while every link segment is disconnected
+  food_radius: 0.22
+  neutral_radius: 0.3
+  neutral_push_fraction: 0.3    # share of an overlap absorbed by the neutral object (light push)
+  spawn_tries: 60               # rejection-sampling attempts when placing an object
+  # A history is a fixed version of the world: layout_seed fixes obstacles, neutral
+  # objects and initial food; the run seed only sets the body's start pose and
+  # where food reappears.
+  histories:
+    0:
+      name: abundancia
+      layout_seed: 1000
+      food_count: 12
+      food_respawn_steps: 40
+      food_distribution: uniform  # uniform | patches
+      food_patches: 0
+      patch_radius: 0.0
+      obstacle_layout: scattered  # scattered | corridors | clustered
+      obstacle_count: 4
+      obstacle_radius: [0.3, 0.6]
+      neutral_count: 4
+    1:
+      name: escasez
+      layout_seed: 1001
+      food_count: 3
+      food_respawn_steps: 300
+      food_distribution: uniform
+      food_patches: 0
+      patch_radius: 0.0
+      obstacle_layout: scattered
+      obstacle_count: 9
+      obstacle_radius: [0.3, 0.7]
+      neutral_count: 3
+    2:
+      name: corredores
+      layout_seed: 1002
+      food_count: 6
+      food_respawn_steps: 120
+      food_distribution: uniform
+      food_patches: 0
+      patch_radius: 0.0
+      obstacle_layout: corridors
+      obstacle_count: 3           # extra scattered obstacles besides the corridor walls
+      obstacle_radius: [0.3, 0.5]
+      neutral_count: 3
+    3:
+      name: oasis
+      layout_seed: 1003
+      food_count: 8
+      food_respawn_steps: 80
+      food_distribution: patches
+      food_patches: 2
+      patch_radius: 0.9
+      obstacle_layout: clustered
+      obstacle_count: 10
+      obstacle_radius: [0.25, 0.5]
+      neutral_count: 10
+
+body:
+  trunk_radius: 0.5
+  max_speed: 0.12               # forward/backward distance per step at action 1
+  max_turn: 0.2                 # trunk rotation (rad) per step at action 1
+  limb_mount_angles: [0.785398, -0.785398]  # left, right limb roots relative to heading (rad)
+  segment_lengths: [0.45, 0.35] # proximal, distal
+  limb_radius: 0.05             # limb thickness, used for contact gaps only
+  joint_limits: [[-1.3, 1.3], [-2.2, 2.2]]  # [proximal, distal] joint angle ranges (rad)
+  max_joint_speed: 0.3          # rad per step at action 1
+  touch_range: 0.08             # contact intensity falls from 1 (gap<=0) to 0 (gap>=range)
+  vision_rays: 7
+  vision_fov: 2.094395          # 120 degrees, centred on the heading
+  vision_range: 3.0
+  energy:
+    initial: 1.0
+    basal: 0.0004               # metabolic cost per step
+    effort_cost: 0.0016         # extra cost per step at maximal effort (effort = mean squared executed action)
+    food_value: 0.25
+    low_threshold: 0.2          # below this energy, strength scales down linearly ...
+    min_strength: 0.3           # ... to this at energy 0 (never zero: no death)
+  # PROVISIONAL values (protocol: fatigue exists; parameters not yet calibrated).
+  fatigue:
+    decay: 0.98                 # F <- decay * F + gain * effort, clipped to [0, 1]
+    gain: 0.02
+    max_penalty: 0.3            # strength multiplier is (1 - max_penalty * F)
+
+random_agent:
+  steps: 2000
+  smoothing: 0.9                # Ornstein-Uhlenbeck-like: a <- s*a + sqrt(1-s^2)*scale*N(0,1)
+  scale: 0.8
+  gif_steps: 300                # first N steps rendered to run.gif
+  gif_stride: 2
+  gif_fps: 15
