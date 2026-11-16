@@ -1,4 +1,4 @@
-"""Arena state and geometry: a closed square with circular objects.
+"""Arena state and batched geometry: closed squares with circular objects.
 
 Coordinates: ``x`` and ``y`` in ``[0, size]``; angles in radians, counter-clockwise
 from +x. All objects are circles. Object kinds share one integer code space with
@@ -6,7 +6,11 @@ the touch/vision type one-hots:
 
     WALL=0, FOOD=1, OBSTACLE=2, NEUTRAL=3, SELF=4  (SELF is touch-only)
 
-Only the numpy ``Generator`` passed in is used for randomness.
+Batching rule (exact equivalence between a batch and single environments): every
+function here works on arrays with a leading batch axis and computes each row
+with the same elementwise operations, whatever the batch size. Reductions run
+only along the last axis (whose length does not depend on the batch), and there
+is no matrix multiplication (BLAS blocking can depend on the array shape).
 """
 
 from __future__ import annotations
@@ -19,10 +23,15 @@ WALL, FOOD, OBSTACLE, NEUTRAL, SELF = 0, 1, 2, 3, 4
 KIND_NAMES = ("wall", "food", "obstacle", "neutral", "self")
 N_TOUCH_TYPES = 5   # wall, food, obstacle, neutral, self
 N_VISION_TYPES = 4  # wall, food, obstacle, neutral (vision does not see the own body)
+FAR = 1.0e6         # position of padding objects (radius 0): they never interact
+
+# Outward normal angle of each wall, in the order used by ``wall_gaps``.
+WALL_NORMAL_ANGLES = np.array([np.pi, 0.0, -np.pi / 2, np.pi / 2])
 
 
 @dataclass
 class Arena:
+    """One arena (unbatched). Used to build histories and for hand-built scenes."""
     size: float
     obstacle_pos: np.ndarray   # (O, 2), fixed
     obstacle_r: np.ndarray     # (O,)
@@ -50,89 +59,113 @@ class Arena:
         return pos, r, kind
 
 
-# --- geometry -----------------------------------------------------------------
+# --- elementary geometry (any leading shape) ----------------------------------
 
 def unit(angle: np.ndarray | float) -> np.ndarray:
     angle = np.asarray(angle, dtype=float)
     return np.stack([np.cos(angle), np.sin(angle)], axis=-1)
 
 
+def norm2(v: np.ndarray) -> np.ndarray:
+    """Euclidean norm over the last axis of length 2 (explicit, shape-independent)."""
+    return np.sqrt(v[..., 0] * v[..., 0] + v[..., 1] * v[..., 1])
+
+
+def wrap_angle(a: np.ndarray | float) -> np.ndarray:
+    return (np.asarray(a, dtype=float) + np.pi) % (2 * np.pi) - np.pi
+
+
 def wall_gaps(points: np.ndarray, size: float) -> np.ndarray:
-    """Distance from each point (P,2) to the 4 walls: (P,4) = [left, right, bottom, top]."""
-    x, y = points[:, 0], points[:, 1]
-    return np.stack([x, size - x, y, size - y], axis=1)
+    """Distance from points (..., 2) to the 4 walls -> (..., 4) = [left, right, bottom, top]."""
+    x, y = points[..., 0], points[..., 1]
+    return np.stack([x, size - x, y, size - y], axis=-1)
 
 
-# Outward normal angle of each wall, in the order used by ``wall_gaps``.
-WALL_NORMAL_ANGLES = np.array([np.pi, 0.0, -np.pi / 2, np.pi / 2])
+def clamp_in_arena(center: np.ndarray, radius: np.ndarray | float, size: float) -> np.ndarray:
+    r = np.asarray(radius, dtype=float)
+    if r.ndim:
+        r = r[..., None]
+    return np.clip(center, r, size - r)
+
+
+def point_segment_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Distance from points p to segments [a, b]; all (..., 2), broadcast together."""
+    ab = b - a
+    ap = p - a
+    denom = ab[..., 0] * ab[..., 0] + ab[..., 1] * ab[..., 1]
+    num = ap[..., 0] * ab[..., 0] + ap[..., 1] * ab[..., 1]
+    safe = np.where(denom == 0, 1.0, denom)
+    t = np.where(denom == 0, 0.0, np.clip(num / safe, 0.0, 1.0))
+    closest = a + t[..., None] * ab
+    return norm2(p - closest)
+
+
+def push_out_of_circles(center: np.ndarray, radius: np.ndarray, pos: np.ndarray, r: np.ndarray,
+                        iterations: int = 3) -> np.ndarray:
+    """Move circles out of fixed circles.
+
+    center (B, K, 2), radius (B, K) or scalar; pos (B, M, 2), r (B, M).
+    Overlaps are resolved by summing push vectors over the M blockers (last-axis
+    sums, padding contributes exact zeros).
+    """
+    c = np.array(center, dtype=float, copy=True)
+    if pos.shape[-2] == 0:
+        return c
+    rad = np.broadcast_to(np.asarray(radius, dtype=float), c.shape[:-1])
+    for _ in range(iterations):
+        dx = c[..., :, None, 0] - pos[..., None, :, 0]          # (B, K, M)
+        dy = c[..., :, None, 1] - pos[..., None, :, 1]
+        dist = np.sqrt(dx * dx + dy * dy)
+        overlap = rad[..., :, None] + r[..., None, :] - dist
+        hit = overlap > 0
+        if not hit.any():
+            break  # nothing overlaps anywhere: further iterations would only add exact zeros
+        tiny = dist <= 1e-9
+        safe = np.where(tiny, 1.0, dist)
+        nx = np.where(tiny, 1.0, dx / safe)
+        ny = np.where(tiny, 0.0, dy / safe)
+        amount = np.where(hit, overlap, 0.0)
+        c[..., 0] += np.sum(nx * amount, axis=-1)
+        c[..., 1] += np.sum(ny * amount, axis=-1)
+    return c
 
 
 def cast_rays(origin: np.ndarray, angles: np.ndarray, size: float, max_range: float,
-              obj_pos: np.ndarray, obj_r: np.ndarray, obj_kind: np.ndarray
+              obj_pos: np.ndarray, obj_r: np.ndarray, obj_kind: np.ndarray, obj_on: np.ndarray
               ) -> tuple[np.ndarray, np.ndarray]:
-    """First hit along each ray from ``origin``.
+    """First hit along each ray.
 
-    Returns (distance (R,), kind (R,)); distance is ``max_range`` and kind -1 when
-    nothing is hit within range.
+    origin (B, 2), angles (B, R), obj_pos (B, M, 2), obj_r (B, M), obj_kind (M,),
+    obj_on (B, M) bool. Returns (distance (B, R), kind (B, R)); distance is
+    ``max_range`` and kind -1 when nothing is hit within range.
     """
-    d = unit(angles)                                         # (R,2)
-    # Walls: the ray always leaves the arena through some wall.
+    dxr, dyr = np.cos(angles), np.sin(angles)                     # (B, R)
+    ox, oy = origin[:, 0:1], origin[:, 1:2]
     with np.errstate(divide="ignore", invalid="ignore"):
-        tx = np.where(d[:, 0] > 0, (size - origin[0]) / d[:, 0],
-                      np.where(d[:, 0] < 0, -origin[0] / d[:, 0], np.inf))
-        ty = np.where(d[:, 1] > 0, (size - origin[1]) / d[:, 1],
-                      np.where(d[:, 1] < 0, -origin[1] / d[:, 1], np.inf))
+        tx = np.where(dxr > 0, (size - ox) / dxr, np.where(dxr < 0, -ox / dxr, np.inf))
+        ty = np.where(dyr > 0, (size - oy) / dyr, np.where(dyr < 0, -oy / dyr, np.inf))
     t_best = np.minimum(tx, ty)
-    kind_best = np.full(len(angles), WALL)
+    kind_best = np.full(angles.shape, WALL)
 
-    if len(obj_r):
-        oc = obj_pos - origin                               # (M,2)
-        t_ca = d @ oc.T                                     # (R,M)
-        d2 = (oc * oc).sum(1)[None, :] - t_ca**2
-        disc = obj_r[None, :] ** 2 - d2
+    if obj_pos.shape[1]:
+        ocx = obj_pos[:, None, :, 0] - origin[:, None, None, 0]   # (B, 1, M)
+        ocy = obj_pos[:, None, :, 1] - origin[:, None, None, 1]
+        t_ca = dxr[:, :, None] * ocx + dyr[:, :, None] * ocy       # (B, R, M)
+        occ = ocx * ocx + ocy * ocy
+        r2 = (obj_r * obj_r)[:, None, :]
+        d2 = occ - t_ca * t_ca
+        disc = r2 - d2
         hit = disc >= 0
         sq = np.sqrt(np.where(hit, disc, 0.0))
         t_hit = t_ca - sq
-        inside = (oc * oc).sum(1) <= obj_r**2               # origin inside the object
-        t_hit = np.where(inside[None, :], 0.0, t_hit)
-        valid = hit & (t_hit >= 0)
+        t_hit = np.where(occ <= r2, 0.0, t_hit)                   # origin inside the object
+        valid = hit & (t_hit >= 0) & obj_on[:, None, :]
         t_hit = np.where(valid, t_hit, np.inf)
-        j = np.argmin(t_hit, axis=1)
-        t_obj = t_hit[np.arange(len(angles)), j]
+        j = np.argmin(t_hit, axis=-1)                              # (B, R)
+        t_obj = np.take_along_axis(t_hit, j[..., None], axis=-1)[..., 0]
         closer = t_obj < t_best
         t_best = np.where(closer, t_obj, t_best)
         kind_best = np.where(closer, obj_kind[j], kind_best)
 
     miss = t_best >= max_range
     return np.where(miss, max_range, t_best), np.where(miss, -1, kind_best)
-
-
-def point_segment_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
-    ab = b - a
-    denom = float(ab @ ab)
-    t = 0.0 if denom == 0 else float(np.clip((p - a) @ ab / denom, 0.0, 1.0))
-    return float(np.linalg.norm(p - (a + t * ab)))
-
-
-def push_out_of_circles(center: np.ndarray, radius: float, pos: np.ndarray, r: np.ndarray,
-                        iterations: int = 3) -> np.ndarray:
-    """Move a circle so it does not overlap any of the given fixed circles."""
-    c = center.astype(float).copy()
-    if not len(r):
-        return c
-    for _ in range(iterations):
-        diff = c - pos
-        dist = np.sqrt((diff * diff).sum(1))
-        overlap = radius + r - dist
-        mask = overlap > 0
-        if not mask.any():
-            break
-        safe = np.where(dist[mask] > 1e-9, dist[mask], 1.0)
-        normals = diff[mask] / safe[:, None]
-        normals[dist[mask] <= 1e-9] = (1.0, 0.0)
-        c += (normals * overlap[mask][:, None]).sum(0)
-    return c
-
-
-def clamp_in_arena(center: np.ndarray, radius: float, size: float) -> np.ndarray:
-    return np.clip(center, radius, size - radius)

@@ -1,6 +1,9 @@
 """The physical body: trunk, two 2-segment limbs, kinematics, energy and fatigue.
 
-Pure kinematics in numpy, no physics engine.
+Pure kinematics in numpy, no physics engine. The kernels work on batches
+(leading axis ``B``); the unbatched helpers (``limb_points``, ``move_body``,
+``update_energy``) are thin wrappers around a batch of one, so there is a single
+implementation.
 
 Kinematics of limb ``i`` (0 = left, 1 = right), with trunk centre ``c``, heading
 ``h``, trunk radius ``R``, mount angle ``m_i`` and joint angles ``q_i1, q_i2``::
@@ -19,9 +22,9 @@ body's current strength (lower at low energy and high fatigue).
 
 Rules:
 - The trunk never passes through walls or obstacles (if push-out cannot clear an
-  overlap, e.g. wedged between two obstacles, the trunk move is reverted). Neutral objects absorb
-  ``push_fraction`` of an overlap (a light push) and never pass through walls or
-  obstacles themselves.
+  overlap, e.g. wedged between two obstacles, the trunk move is reverted).
+  Neutral objects absorb ``push_fraction`` of an overlap (a light push) and never
+  pass through walls or obstacles themselves.
 - Limbs only sense obstacles, but may not cross walls: a joint move that would put
   a limb point outside the arena is reverted; if the limb is outside even with its
   previous angles (trunk moved too close to a wall), the trunk move is reverted.
@@ -38,7 +41,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from umbral.config import Config
-from umbral.world.arena import Arena, clamp_in_arena, push_out_of_circles, unit
+from umbral.world.arena import Arena, clamp_in_arena, norm2, push_out_of_circles, unit, wrap_angle
 
 ACTION_DIM = 6
 
@@ -93,8 +96,9 @@ class BodyParams:
 
 @dataclass
 class BodyState:
+    """One body (unbatched)."""
     pos: np.ndarray        # (2,) trunk centre
-    heading: float         # radians, wrapped to (-pi, pi]
+    heading: float         # radians, wrapped to [-pi, pi)
     q: np.ndarray          # (2, 2) joint angles [limb, joint]
     dq: np.ndarray         # (2, 2) joint change actually performed last step
     energy: float
@@ -105,110 +109,144 @@ class BodyState:
                          float(self.energy), float(self.fatigue))
 
 
-def wrap_angle(a: float) -> float:
-    return float((a + np.pi) % (2 * np.pi) - np.pi)
+# --- batched kernels ------------------------------------------------------------
 
-
-def limb_points(p: BodyParams, pos: np.ndarray, heading: float, q: np.ndarray) -> np.ndarray:
-    """Points (2 limbs, [base, elbow, tip], xy) -> shape (2, 3, 2)."""
-    a0 = heading + p.mount_angles                 # (2,)
-    a1 = a0 + q[:, 0]
-    a2 = a1 + q[:, 1]
-    base = pos + p.trunk_radius * unit(a0)
+def limb_points_b(p: BodyParams, pos: np.ndarray, heading: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """pos (B,2), heading (B,), q (B,2,2) -> points (B, 2 limbs, [base, elbow, tip], 2)."""
+    a0 = heading[:, None] + p.mount_angles[None, :]      # (B, 2)
+    a1 = a0 + q[:, :, 0]
+    a2 = a1 + q[:, :, 1]
+    base = pos[:, None, :] + p.trunk_radius * unit(a0)
     elbow = base + p.seg_lengths[0] * unit(a1)
     tip = elbow + p.seg_lengths[1] * unit(a2)
-    return np.stack([base, elbow, tip], axis=1)
+    return np.stack([base, elbow, tip], axis=2)
 
 
-def _limb_inside(p: BodyParams, size: float, pos: np.ndarray, heading: float, q_limb: np.ndarray,
-                 i: int) -> bool:
-    a1 = heading + p.mount_angles[i] + q_limb[0]
-    a2 = a1 + q_limb[1]
-    base = pos + p.trunk_radius * unit(heading + p.mount_angles[i])
-    elbow = base + p.seg_lengths[0] * unit(a1)
-    tip = elbow + p.seg_lengths[1] * unit(a2)
+def _limbs_inside_b(p: BodyParams, size: float, pos: np.ndarray, heading: np.ndarray,
+                    q: np.ndarray) -> np.ndarray:
+    """(B, 2) bool: elbow and tip of each limb inside the arena (minus limb radius)."""
+    pts = limb_points_b(p, pos, heading, q)[:, :, 1:]    # (B, 2, 2 points, 2)
     lo, hi = p.limb_radius, size - p.limb_radius
-    pts = np.stack([elbow, tip])
-    return bool(((pts >= lo) & (pts <= hi)).all())
+    return ((pts >= lo) & (pts <= hi)).all(axis=(-1, -2))
 
 
-def strength(p: BodyParams, energy: float, fatigue: float) -> float:
-    s_energy = p.min_strength + (1.0 - p.min_strength) * min(1.0, energy / p.low_threshold)
+def strength_b(p: BodyParams, energy: np.ndarray, fatigue: np.ndarray) -> np.ndarray:
+    s_energy = p.min_strength + (1.0 - p.min_strength) * np.minimum(1.0, energy / p.low_threshold)
     return s_energy * (1.0 - p.fatigue_max_penalty * fatigue)
 
 
-def _trunk_clear(p: BodyParams, arena: Arena, pos: np.ndarray, tol: float = 1e-9) -> bool:
-    """Trunk inside the arena and not overlapping any obstacle."""
+def _trunk_clear_b(p: BodyParams, size: float, pos: np.ndarray, obs_pos: np.ndarray, obs_r: np.ndarray,
+                   tol: float = 1e-9) -> np.ndarray:
     R = p.trunk_radius
-    if (pos < R - tol).any() or (pos > arena.size - R + tol).any():
-        return False
-    if not len(arena.obstacle_r):
-        return True
-    gap = np.sqrt(((arena.obstacle_pos - pos) ** 2).sum(1)) - arena.obstacle_r - R
-    return bool(gap.min() >= -tol)
+    ok = ((pos >= R - tol) & (pos <= size - R + tol)).all(axis=-1)
+    if obs_pos.shape[1]:
+        gap = norm2(obs_pos - pos[:, None, :]) - obs_r - R
+        ok &= gap.min(axis=-1) >= -tol
+    return ok
 
 
-def _resolve_trunk(p: BodyParams, arena: Arena, pos: np.ndarray, push_fraction: float) -> np.ndarray:
-    R, size = p.trunk_radius, arena.size
-    pos = push_out_of_circles(clamp_in_arena(pos, R, size), R, arena.obstacle_pos, arena.obstacle_r)
-    if len(arena.neutral_r):
-        diff = arena.neutral_pos - pos
-        dist = np.sqrt((diff * diff).sum(1))
-        overlap = R + arena.neutral_r - dist
-        for j in np.flatnonzero(overlap > 0):
-            n = diff[j] / dist[j] if dist[j] > 1e-9 else np.array([1.0, 0.0])
-            r = arena.neutral_r[j]
-            new = arena.neutral_pos[j] + n * overlap[j] * push_fraction
-            new = push_out_of_circles(clamp_in_arena(new, r, size), r, arena.obstacle_pos, arena.obstacle_r)
-            arena.neutral_pos[j] = clamp_in_arena(new, r, size)
+def _resolve_trunk_b(p: BodyParams, size: float, pos: np.ndarray, obs_pos: np.ndarray, obs_r: np.ndarray,
+                     neu_pos: np.ndarray, neu_r: np.ndarray, push_fraction: float
+                     ) -> tuple[np.ndarray, np.ndarray]:
+    """Returns (new trunk pos (B,2), new neutral positions (B,N,2))."""
+    R = p.trunk_radius
+    pos = push_out_of_circles(clamp_in_arena(pos, R, size)[:, None], R, obs_pos, obs_r)[:, 0]
+    neu = neu_pos
+    if neu_pos.shape[1]:
+        diff = neu_pos - pos[:, None, :]
+        dist = norm2(diff)
+        overlap = R + neu_r - dist
+        hit = overlap > 0
+        if hit.any():  # rows without a touched neutral keep neu_pos unchanged either way
+            tiny = dist <= 1e-9
+            safe = np.where(tiny, 1.0, dist)
+            n = np.where(tiny[..., None], np.array([1.0, 0.0]), diff / safe[..., None])
+            moved = neu_pos + n * (overlap * push_fraction)[..., None]
+            moved = push_out_of_circles(clamp_in_arena(moved, neu_r, size), neu_r, obs_pos, obs_r)
+            moved = clamp_in_arena(moved, neu_r, size)
+            neu = np.where(hit[..., None], moved, neu_pos)
     for _ in range(2):
-        pos = push_out_of_circles(pos, R, arena.neutral_pos, arena.neutral_r)
-        pos = push_out_of_circles(clamp_in_arena(pos, R, size), R, arena.obstacle_pos, arena.obstacle_r)
+        pos = push_out_of_circles(pos[:, None], R, neu, neu_r)[:, 0]
+        pos = push_out_of_circles(clamp_in_arena(pos, R, size)[:, None], R, obs_pos, obs_r)[:, 0]
         pos = clamp_in_arena(pos, R, size)
-    return pos
+    return pos, neu
+
+
+def move_body_b(p: BodyParams, size: float, pos: np.ndarray, heading: np.ndarray, q: np.ndarray,
+                energy: np.ndarray, fatigue: np.ndarray, obs_pos: np.ndarray, obs_r: np.ndarray,
+                neu_pos: np.ndarray, neu_r: np.ndarray, applied: np.ndarray, push_fraction: float) -> dict:
+    """One movement step for a batch. Pure: returns new arrays, mutates nothing.
+
+    Keys: pos, heading, q, dq, neutral_pos, executed, effort.
+    """
+    executed = np.clip(applied, -1.0, 1.0) * strength_b(p, energy, fatigue)[:, None]
+    h_new = heading + executed[:, 1] * p.max_turn
+    pos_try = pos + (executed[:, 0] * p.max_speed)[:, None] * unit(h_new)
+    pos_new, neu_new = _resolve_trunk_b(p, size, pos_try, obs_pos, obs_r, neu_pos, neu_r, push_fraction)
+
+    q_new = np.clip(q + executed[:, 2:].reshape(-1, 2, 2) * p.max_joint_speed, p.joint_lo, p.joint_hi)
+    ok_new = _limbs_inside_b(p, size, pos_new, h_new, q_new)
+    ok_old = _limbs_inside_b(p, size, pos_new, h_new, q)
+    trunk_ok = _trunk_clear_b(p, size, pos_new, obs_pos, obs_r) & (ok_new | ok_old).all(axis=-1)
+    ok_reverted = _limbs_inside_b(p, size, pos, heading, q_new)
+
+    q_keep = np.where(ok_new[..., None], q_new, q)
+    q_rev = np.where(ok_reverted[..., None], q_new, q)
+    q_out = np.where(trunk_ok[:, None, None], q_keep, q_rev)
+    return {
+        "pos": np.where(trunk_ok[:, None], pos_new, pos),
+        "heading": wrap_angle(np.where(trunk_ok, h_new, heading)),
+        "q": q_out,
+        "dq": q_out - q,
+        "neutral_pos": np.where(trunk_ok[:, None, None], neu_new, neu_pos),
+        "executed": executed,
+        "effort": np.mean(executed * executed, axis=-1),
+    }
+
+
+def update_energy_b(p: BodyParams, energy: np.ndarray, fatigue: np.ndarray, effort: np.ndarray,
+                    n_eaten: np.ndarray) -> dict[str, np.ndarray]:
+    """Energy/fatigue after one step, with the balance terms (all (B,))."""
+    basal = np.full(energy.shape, p.basal)
+    effort_cost = p.effort_cost * effort
+    food_gain = p.food_value * n_eaten
+    unclipped = energy - basal - effort_cost + food_gain
+    return {
+        "before": np.array(energy, dtype=float, copy=True), "basal": basal, "effort_cost": effort_cost, "food_gain": food_gain,
+        "unclipped": unclipped, "after": np.minimum(1.0, np.maximum(0.0, unclipped)),
+        "fatigue": np.minimum(1.0, np.maximum(0.0, p.fatigue_decay * fatigue + p.fatigue_gain * effort)),
+    }
+
+
+# --- unbatched wrappers (batch of one) -------------------------------------------
+
+def limb_points(p: BodyParams, pos: np.ndarray, heading: float, q: np.ndarray) -> np.ndarray:
+    """Points (2 limbs, [base, elbow, tip], xy) -> shape (2, 3, 2)."""
+    return limb_points_b(p, np.asarray(pos, float)[None], np.array([heading], float),
+                         np.asarray(q, float)[None])[0]
+
+
+def strength(p: BodyParams, energy: float, fatigue: float) -> float:
+    return float(strength_b(p, np.array([energy]), np.array([fatigue]))[0])
 
 
 def move_body(p: BodyParams, arena: Arena, st: BodyState, applied: np.ndarray,
               push_fraction: float) -> tuple[np.ndarray, float]:
-    """Advance the body one step in place. Returns (executed action, effort)."""
-    executed = np.clip(applied, -1.0, 1.0) * strength(p, st.energy, st.fatigue)
-    old_pos, old_h, old_q = st.pos.copy(), st.heading, st.q.copy()
-    old_neutral = arena.neutral_pos.copy()
-
-    h = old_h + executed[1] * p.max_turn
-    pos = _resolve_trunk(p, arena, old_pos + executed[0] * p.max_speed * unit(h), push_fraction)
-
-    q_new = np.clip(old_q + executed[2:].reshape(2, 2) * p.max_joint_speed, p.joint_lo, p.joint_hi)
-    q = old_q.copy()
-    # Wedged between obstacles, push-out may not fully converge: then the trunk stays put.
-    trunk_ok = _trunk_clear(p, arena, pos)
-    for i in range(2):
-        if not trunk_ok:
-            break
-        if _limb_inside(p, arena.size, pos, h, q_new[i], i):
-            q[i] = q_new[i]
-        elif not _limb_inside(p, arena.size, pos, h, old_q[i], i):
-            trunk_ok = False
-    if not trunk_ok:
-        pos, h = old_pos, old_h
-        arena.neutral_pos[:] = old_neutral
-        for i in range(2):
-            q[i] = q_new[i] if _limb_inside(p, arena.size, pos, h, q_new[i], i) else old_q[i]
-
-    st.pos, st.heading = pos, wrap_angle(h)
-    st.dq = q - old_q
-    st.q = q
-    return executed, float(np.mean(executed**2))
+    """Advance one body in place (and push the arena's neutral objects). Returns (executed, effort)."""
+    out = move_body_b(
+        p, arena.size, st.pos[None], np.array([st.heading]), st.q[None],
+        np.array([st.energy]), np.array([st.fatigue]),
+        arena.obstacle_pos[None], arena.obstacle_r[None], arena.neutral_pos[None], arena.neutral_r[None],
+        np.asarray(applied, float)[None], push_fraction)
+    st.pos, st.heading = out["pos"][0], float(out["heading"][0])
+    st.q, st.dq = out["q"][0], out["dq"][0]
+    arena.neutral_pos[:] = out["neutral_pos"][0]
+    return out["executed"][0], float(out["effort"][0])
 
 
 def update_energy(p: BodyParams, st: BodyState, effort: float, n_eaten: int) -> dict[str, float]:
-    """Apply one step of metabolism, effort cost and food gain; return the balance."""
-    before = st.energy
-    basal = p.basal
-    effort_cost = p.effort_cost * effort
-    food_gain = p.food_value * n_eaten
-    unclipped = before - basal - effort_cost + food_gain
-    st.energy = float(min(1.0, max(0.0, unclipped)))
-    st.fatigue = float(min(1.0, max(0.0, p.fatigue_decay * st.fatigue + p.fatigue_gain * effort)))
-    return {"before": before, "basal": basal, "effort_cost": effort_cost, "food_gain": food_gain,
-            "unclipped": unclipped, "after": st.energy}
+    """Apply one step of metabolism, effort cost and food gain in place; return the balance."""
+    b = update_energy_b(p, np.array([st.energy]), np.array([st.fatigue]), np.array([effort]),
+                        np.array([n_eaten], float))
+    st.energy, st.fatigue = float(b["after"][0]), float(b["fatigue"][0])
+    return {k: float(b[k][0]) for k in ("before", "basal", "effort_cost", "food_gain", "unclipped", "after")}

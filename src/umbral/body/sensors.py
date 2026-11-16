@@ -17,7 +17,7 @@ in flat-vector order:
     columns:  ``[intensity, wall, food, obstacle, neutral, self]``; intensity is
               ``clip(1 - gap / touch_range, 0, 1)`` (1 when touching or
               penetrating); the one-hot names the kind of the strongest contact
-              and is all zero when intensity is 0.
+              (the first one on ties) and is all zero when intensity is 0.
     Self-contact is felt on both sides: a limb tip touching the trunk activates
     that tip (type self) and the contour sensor whose arc contains the contact
     point (type self). A tip touching the other limb activates the tip.
@@ -36,6 +36,8 @@ Body parts for the BodyLink:
   touch sensor and 2 motor components.
 - ``trunk``: orientation, the 8 contour touch sensors, vision, interoception,
   and the forward/turn motor components.
+
+The ``*_b`` functions are the batched kernels; the others wrap a batch of one.
 """
 
 from __future__ import annotations
@@ -44,9 +46,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from umbral.body.body import BodyParams, BodyState, wrap_angle
+from umbral.body.body import BodyParams, BodyState
 from umbral.world.arena import (N_TOUCH_TYPES, N_VISION_TYPES, SELF, WALL, WALL_NORMAL_ANGLES, Arena,
-                                cast_rays, point_segment_distance, unit, wall_gaps)
+                                cast_rays, norm2, point_segment_distance, unit, wall_gaps, wrap_angle)
 
 CHANNELS = ("proprio", "touch", "vision", "intero")
 PARTS = ("trunk", "left_limb", "right_limb")
@@ -101,8 +103,9 @@ class ObsLayout:
         ]
 
     def split(self, flat: np.ndarray) -> dict[str, np.ndarray]:
-        """Channel dict (reshaped copies) from a flat vector."""
-        out = {k: flat[sl].reshape(self.shapes[k]).copy() for k, sl in self.slices.items()}
+        """Channel dict (reshaped copies) from a flat vector (..., dim)."""
+        lead = flat.shape[:-1]
+        out = {k: flat[..., sl].reshape(*lead, *self.shapes[k]).copy() for k, sl in self.slices.items()}
         out["flat"] = flat.copy()
         return out
 
@@ -118,90 +121,134 @@ def _intensity(gap: np.ndarray, touch_range: float) -> np.ndarray:
     return np.clip(1.0 - gap / touch_range, 0.0, 1.0)
 
 
-def touch_sensors(p: BodyParams, arena: Arena, st: BodyState, limbs: np.ndarray,
-                  objects: tuple[np.ndarray, np.ndarray, np.ndarray]) -> np.ndarray:
-    """(10, 6) touch array; see module docstring."""
-    out = np.zeros((N_TOUCH, TOUCH_WIDTH))
-    obj_pos, obj_r, obj_kind = objects
-    c, R, tr, lr = st.pos, p.trunk_radius, p.touch_range, p.limb_radius
-    tips = limbs[:, 2]
+# --- batched kernels ------------------------------------------------------------
+
+def touch_b(p: BodyParams, size: float, pos: np.ndarray, heading: np.ndarray, limbs: np.ndarray,
+            obj_pos: np.ndarray, obj_r: np.ndarray, obj_kind: np.ndarray, obj_on: np.ndarray) -> np.ndarray:
+    """(B, 10, 6) touch array; see module docstring."""
+    B = pos.shape[0]
+    R, tr, lr = p.trunk_radius, p.touch_range, p.limb_radius
+    out = np.zeros((B, N_TOUCH, TOUCH_WIDTH))
+    tips = limbs[:, :, 2]                                          # (B, 2, 2)
 
     # Trunk contour: every contact as (gap, world angle of contact point, kind).
-    diff = obj_pos - c
-    tip_diff = tips - c
+    diff = obj_pos - pos[:, None, :]
+    tip_diff = tips - pos[:, None, :]
     gaps = np.concatenate([
-        wall_gaps(c[None], arena.size)[0] - R,
-        np.sqrt((diff * diff).sum(1)) - R - obj_r,
-        np.sqrt((tip_diff * tip_diff).sum(1)) - R - lr,
-    ])
-    angles = np.concatenate([WALL_NORMAL_ANGLES, np.arctan2(diff[:, 1], diff[:, 0]),
-                             np.arctan2(tip_diff[:, 1], tip_diff[:, 0])])
+        wall_gaps(pos, size) - R,
+        norm2(diff) - R - obj_r,
+        norm2(tip_diff) - R - lr,
+    ], axis=1)                                                     # (B, C)
+    angles = np.concatenate([
+        np.broadcast_to(WALL_NORMAL_ANGLES, (B, 4)),
+        np.arctan2(diff[..., 1], diff[..., 0]),
+        np.arctan2(tip_diff[..., 1], tip_diff[..., 0]),
+    ], axis=1)
     kinds = np.concatenate([np.full(4, WALL), obj_kind, np.full(2, SELF)])
-    inten = _intensity(gaps, tr)
+    on = np.concatenate([np.ones((B, 4), bool), obj_on, np.ones((B, 2), bool)], axis=1)
+    inten = np.where(on, _intensity(gaps, tr), 0.0)
     sector = 2 * np.pi / N_CONTOUR
-    for j in np.flatnonzero(inten > 0):
-        k = int(round(wrap_angle(angles[j] - st.heading) / sector)) % N_CONTOUR
-        if inten[j] > out[k, 0]:
-            out[k] = 0.0
-            out[k, 0] = inten[j]
-            out[k, 1 + kinds[j]] = 1.0
+    k = np.rint(wrap_angle(angles - heading[:, None]) / sector).astype(int) % N_CONTOUR
+    # Strongest contact per (row, sector); on ties the first contact wins. Only the few
+    # active contacts are considered, sorted by (row, sector, -intensity, contact index).
+    b, c = np.nonzero(inten > 0)
+    if len(b):
+        kk, v = k[b, c], inten[b, c]
+        order = np.lexsort((c, -v, kk, b))
+        b, c, kk, v = b[order], c[order], kk[order], v[order]
+        first = np.ones(len(b), bool)
+        first[1:] = (b[1:] != b[:-1]) | (kk[1:] != kk[:-1])
+        out[b[first], kk[first], 0] = v[first]
+        out[b[first], kk[first], 1 + kinds[c[first]]] = 1.0
 
-    # Limb tips.
-    for i in range(2):
-        t = tips[i]
-        d = obj_pos - t
-        other = limbs[1 - i]
-        g = np.concatenate([
-            wall_gaps(t[None], arena.size)[0] - lr,
-            np.sqrt((d * d).sum(1)) - obj_r - lr,
-            [np.linalg.norm(t - c) - R - lr,
-             min(point_segment_distance(t, other[0], other[1]),
-                 point_segment_distance(t, other[1], other[2])) - 2 * lr],
-        ])
-        kk = np.concatenate([np.full(4, WALL), obj_kind, [SELF, SELF]])
-        it = _intensity(g, tr)
-        j = int(np.argmax(it))
-        if it[j] > 0:
-            out[N_CONTOUR + i, 0] = it[j]
-            out[N_CONTOUR + i, 1 + kk[j]] = 1.0
+    # Limb tips: walls, objects, own trunk, the other limb.
+    other = limbs[:, ::-1]                                         # (B, 2, 3, 2)
+    tip_other = np.minimum(point_segment_distance(tips, other[:, :, 0], other[:, :, 1]),
+                           point_segment_distance(tips, other[:, :, 1], other[:, :, 2]))
+    d = obj_pos[:, None, :, :] - tips[:, :, None, :]               # (B, 2, M, 2)
+    g = np.concatenate([
+        wall_gaps(tips, size) - lr,
+        norm2(d) - obj_r[:, None, :] - lr,
+        (norm2(tip_diff) - R - lr)[..., None],
+        (tip_other - 2 * lr)[..., None],
+    ], axis=-1)                                                    # (B, 2, 4+M+2)
+    tip_on = np.concatenate([np.ones((B, 2, 4), bool), np.broadcast_to(obj_on[:, None, :], d.shape[:-1]),
+                             np.ones((B, 2, 2), bool)], axis=-1)
+    tip_kinds = np.concatenate([np.full(4, WALL), obj_kind, [SELF, SELF]])
+    it = np.where(tip_on, _intensity(g, tr), 0.0)
+    j = np.argmax(it, axis=-1)                                     # (B, 2)
+    tv = np.take_along_axis(it, j[..., None], axis=-1)[..., 0]
+    out[:, N_CONTOUR:, 0] = tv
+    rows, limb = np.nonzero(tv > 0)
+    out[rows, N_CONTOUR + limb, 1 + tip_kinds[j[rows, limb]]] = 1.0
     return out
 
 
-def tip_food_contacts(p: BodyParams, arena: Arena, limbs: np.ndarray) -> np.ndarray:
-    """Indices of active food items touched (gap <= 0) by either limb tip."""
-    if not len(arena.food_r):
-        return np.zeros(0, int)
-    tips = limbs[:, 2]
-    d = np.sqrt(((arena.food_pos[None] - tips[:, None]) ** 2).sum(-1))  # (2, F)
-    touched = (d - arena.food_r[None] - p.limb_radius <= 0).any(0) & arena.food_active
-    return np.flatnonzero(touched)
+def vision_b(p: BodyParams, size: float, pos: np.ndarray, heading: np.ndarray,
+             obj_pos: np.ndarray, obj_r: np.ndarray, obj_kind: np.ndarray, obj_on: np.ndarray) -> np.ndarray:
+    origin = pos + p.trunk_radius * unit(heading)
+    angles = heading[:, None] + np.linspace(-p.vision_fov / 2, p.vision_fov / 2, p.vision_rays)
+    dist, kind = cast_rays(origin, angles, size, p.vision_range, obj_pos, obj_r, obj_kind, obj_on)
+    out = np.zeros((pos.shape[0], p.vision_rays, VISION_WIDTH))
+    out[..., 0] = dist / p.vision_range
+    rows, rays = np.nonzero(kind >= 0)
+    out[rows, rays, 1 + kind[rows, rays]] = 1.0
+    return out
+
+
+def tip_food_b(p: BodyParams, limbs: np.ndarray, food_pos: np.ndarray, food_r: np.ndarray,
+               food_on: np.ndarray) -> np.ndarray:
+    """(B, F) bool: active food touched (gap <= 0) by either limb tip."""
+    tips = limbs[:, :, 2]
+    gap = norm2(food_pos[:, None, :, :] - tips[:, :, None, :]) - food_r[:, None, :] - p.limb_radius
+    return (gap <= 0).any(axis=1) & food_on
+
+
+def raw_observation_b(p: BodyParams, size: float, pos: np.ndarray, heading: np.ndarray, q: np.ndarray,
+                      dq: np.ndarray, energy: np.ndarray, fatigue: np.ndarray, limbs: np.ndarray,
+                      obj_pos: np.ndarray, obj_r: np.ndarray, obj_kind: np.ndarray, obj_on: np.ndarray
+                      ) -> np.ndarray:
+    """The body's true signals, (B, dim) float64 (before the BodyLink)."""
+    B = pos.shape[0]
+    q_norm = 2.0 * (q - p.joint_lo) / (p.joint_hi - p.joint_lo) - 1.0
+    return np.concatenate([
+        q_norm.reshape(B, 4), (dq / p.max_joint_speed).reshape(B, 4),
+        np.sin(heading)[:, None], np.cos(heading)[:, None],
+        touch_b(p, size, pos, heading, limbs, obj_pos, obj_r, obj_kind, obj_on).reshape(B, -1),
+        vision_b(p, size, pos, heading, obj_pos, obj_r, obj_kind, obj_on).reshape(B, -1),
+        energy[:, None], fatigue[:, None],
+    ], axis=1)
+
+
+# --- unbatched wrappers (batch of one) ---------------------------------------------
+
+def _one(objects: tuple[np.ndarray, np.ndarray, np.ndarray]):
+    pos, r, kind = objects
+    return pos[None], r[None], np.asarray(kind, int), np.ones((1, len(r)), bool)
+
+
+def touch_sensors(p: BodyParams, arena: Arena, st: BodyState, limbs: np.ndarray,
+                  objects: tuple[np.ndarray, np.ndarray, np.ndarray]) -> np.ndarray:
+    """(10, 6) touch array for one body; ``objects`` as returned by ``Arena.objects()``."""
+    return touch_b(p, arena.size, st.pos[None], np.array([st.heading]), limbs[None], *_one(objects))[0]
 
 
 def vision_sensors(p: BodyParams, arena: Arena, st: BodyState,
                    objects: tuple[np.ndarray, np.ndarray, np.ndarray]) -> np.ndarray:
-    origin = st.pos + p.trunk_radius * unit(st.heading)
-    angles = st.heading + np.linspace(-p.vision_fov / 2, p.vision_fov / 2, p.vision_rays)
-    dist, kind = cast_rays(origin, angles, arena.size, p.vision_range, *objects)
-    out = np.zeros((p.vision_rays, VISION_WIDTH))
-    out[:, 0] = dist / p.vision_range
-    hit = kind >= 0
-    out[np.flatnonzero(hit), 1 + kind[hit]] = 1.0
-    return out
+    return vision_b(p, arena.size, st.pos[None], np.array([st.heading]), *_one(objects))[0]
+
+
+def tip_food_contacts(p: BodyParams, arena: Arena, limbs: np.ndarray) -> np.ndarray:
+    """Indices of active food items touched (gap <= 0) by either limb tip."""
+    touched = tip_food_b(p, limbs[None], arena.food_pos[None], arena.food_r[None], arena.food_active[None])
+    return np.flatnonzero(touched[0])
 
 
 def raw_observation(p: BodyParams, arena: Arena, st: BodyState, limbs: np.ndarray) -> np.ndarray:
-    """The body's true signals as a flat float64 vector (before the BodyLink)."""
-    objects = arena.objects()
-    q_norm = 2.0 * (st.q - p.joint_lo) / (p.joint_hi - p.joint_lo) - 1.0
-    proprio = np.concatenate([q_norm.ravel(), (st.dq / p.max_joint_speed).ravel(),
-                              [np.sin(st.heading), np.cos(st.heading)]])
-    return np.concatenate([
-        proprio,
-        touch_sensors(p, arena, st, limbs, objects).ravel(),
-        vision_sensors(p, arena, st, objects).ravel(),
-        [st.energy, st.fatigue],
-    ])
+    return raw_observation_b(p, arena.size, st.pos[None], np.array([st.heading]), st.q[None], st.dq[None],
+                             np.array([st.energy]), np.array([st.fatigue]), limbs[None],
+                             *_one(arena.objects()))[0]
 
 
-__all__ = ["CHANNELS", "PARTS", "MOTOR_SEGMENTS", "ObsLayout", "Segment", "raw_observation",
-           "tip_food_contacts", "touch_sensors", "vision_sensors"]
+__all__ = ["CHANNELS", "PARTS", "MOTOR_SEGMENTS", "ObsLayout", "Segment", "raw_observation", "raw_observation_b",
+           "tip_food_contacts", "tip_food_b", "touch_b", "touch_sensors", "vision_b", "vision_sensors"]

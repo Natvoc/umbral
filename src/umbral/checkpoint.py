@@ -8,6 +8,14 @@ Guarantees:
   agent at that point (generators included), so any later difference between
   copies comes only from the experimental condition each one receives.
 
+Format v2 (Phase 2a) adds the agent's world: ``env`` (the full state of a
+``BatchedUmbralEnv``: bodies, arenas, food timers, world and link generators,
+BodyLink modes, fade counters and frozen noise statistics), ``policy`` (the
+action policy's state, e.g. OU noise and its generators) and ``mind_state``
+(recurrent hidden states and anything else the mind carries between steps).
+``env`` and ``policy`` hold numpy arrays in memory and are stored as tensors;
+``mind_state`` holds tensors. v1 files still load (those fields are None).
+
 ``random`` and ``torch`` keep their random state globally, per process. Before a
 copy runs, call its ``activate()``: it restores *that copy's* generators into the
 global state and returns its numpy ``Generator``. Run copies one after another,
@@ -31,7 +39,8 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+SUPPORTED_VERSIONS = (1, 2)
 
 
 # --- RNG state <-> plain data -------------------------------------------------
@@ -78,6 +87,15 @@ class Checkpoint:
     rng: dict[str, Any]
     config: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
+    env: dict[str, Any] | None = None
+    policy: dict[str, Any] | None = None
+    mind_state: dict[str, Any] | None = None
+
+    def restore_env(self, env: Any) -> None:
+        """Load this checkpoint's world into an environment built from the same config."""
+        if self.env is None:
+            raise ValueError("checkpoint has no environment state")
+        env.set_state(copy.deepcopy(self.env))
 
     def load_into(
         self,
@@ -114,7 +132,34 @@ class Checkpoint:
             "rng": self.rng,
             "config": self.config,
             "extra": self.extra,
+            "env": _encode(self.env),
+            "policy": _encode(self.policy),
+            "mind_state": self.mind_state,
         }
+
+
+def _encode(value: Any) -> Any:
+    """numpy -> torch (for weights_only-safe storage), recursively."""
+    if isinstance(value, np.ndarray):
+        return torch.from_numpy(np.ascontiguousarray(value).copy())
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {k: _encode(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode(v) for v in value]
+    return value
+
+
+def _decode(value: Any) -> Any:
+    """torch -> numpy, recursively (inverse of ``_encode``)."""
+    if isinstance(value, torch.Tensor):
+        return value.numpy().copy()
+    if isinstance(value, dict):
+        return {k: _decode(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decode(v) for v in value]
+    return value
 
 
 def _check_keys(kind: str, stored: Mapping[str, Any], given: Mapping[str, Any]) -> None:
@@ -129,8 +174,15 @@ def make_checkpoint(
     np_rng: np.random.Generator | None,
     config: Mapping[str, Any] | None = None,
     extra: Mapping[str, Any] | None = None,
+    env: Any = None,
+    policy: Any = None,
+    mind_state: Mapping[str, Any] | None = None,
 ) -> Checkpoint:
-    """Snapshot live objects and the current global RNG state (deep copies)."""
+    """Snapshot live objects and the current global RNG state (deep copies).
+
+    ``env`` and ``policy`` are live objects with ``get_state()``; ``mind_state``
+    is a dict of tensors (cloned).
+    """
     to_plain = getattr(config, "to_dict", None)
     return Checkpoint(
         step=int(step),
@@ -138,7 +190,12 @@ def make_checkpoint(
         optimizers={k: copy.deepcopy(o.state_dict()) for k, o in optimizers.items()},
         rng=capture_rng_state(np_rng),
         config=to_plain() if to_plain else dict(config or {}),
-        extra=dict(extra or {}),
+        extra=copy.deepcopy(dict(extra or {})),
+        env=None if env is None else copy.deepcopy(env.get_state()),
+        policy=None if policy is None else copy.deepcopy(policy.get_state()),
+        mind_state=None if mind_state is None else {
+            k: (v.detach().clone() if isinstance(v, torch.Tensor) else copy.deepcopy(v))
+            for k, v in mind_state.items()},
     )
 
 
@@ -155,19 +212,22 @@ def save_checkpoint(path: str | Path, checkpoint: Checkpoint) -> Path:
 def load_checkpoint(path: str | Path) -> Checkpoint:
     data = torch.load(Path(path), map_location="cpu", weights_only=True)
     version = data.get("format_version")
-    if version != FORMAT_VERSION:
+    if version not in SUPPORTED_VERSIONS:
         raise ValueError(f"{path}: unsupported checkpoint format {version!r}")
     return Checkpoint(
         step=data["step"], models=data["models"], optimizers=data["optimizers"],
         rng=data["rng"], config=data["config"], extra=data["extra"],
+        env=_decode(data.get("env")), policy=_decode(data.get("policy")),
+        mind_state=data.get("mind_state"),
     )
 
 
 def clone(checkpoint: Checkpoint | str | Path, n: int) -> list[Checkpoint]:
     """Return ``n`` independent, identical copies of the agent at ``checkpoint``.
 
-    Each copy owns its tensors and RNG state (no sharing with the source or with
-    each other). Run each one after calling its ``activate()``.
+    Each copy owns its tensors, RNG state and (v2) its world, policy and mind
+    state (no sharing with the source or with each other). Run each one after
+    calling its ``activate()``; restore its world with ``restore_env(env)``.
     """
     if n < 1:
         raise ValueError("n must be >= 1")

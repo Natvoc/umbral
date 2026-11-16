@@ -1,4 +1,4 @@
-"""UmbralEnv: the 2D world plus the agent's body, with Gymnasium-style signatures.
+"""UmbralEnv: one world plus the agent's body, with Gymnasium-style signatures.
 
     env = UmbralEnv(config)
     obs, info = env.reset(seed=0)
@@ -22,6 +22,9 @@ recorded. When the body is restored the agent finds it exactly as it left it.
 
 Randomness: ``reset(seed)`` derives two independent generators from ``seed``:
 one for the world (start pose, food respawns) and one for the link's noise.
+
+Implementation: a ``BatchedUmbralEnv`` of size one. ``env.arena``, ``env.body``
+and ``env.link`` are live views into it.
 """
 
 from __future__ import annotations
@@ -30,154 +33,119 @@ from typing import Any
 
 import numpy as np
 
-from umbral.body.body import ACTION_DIM, BodyParams, BodyState, limb_points, move_body, update_energy
+from umbral.body.body import ACTION_DIM
 from umbral.body.link import BodyLink
-from umbral.body.sensors import ObsLayout, raw_observation, tip_food_contacts
 from umbral.config import Config
 from umbral.world.arena import Arena
-from umbral.world.histories import build_arena, spawn_food_point
+from umbral.world.batched import BatchedUmbralEnv
+
+
+class _BodyView:
+    """Live view of the body of a batch row (same attributes as ``BodyState``)."""
+
+    def __init__(self, env: BatchedUmbralEnv, row: int):
+        self._e, self._r = env, row
+
+    pos = property(lambda self: self._e.pos[self._r])
+    heading = property(lambda self: float(self._e.heading[self._r]))
+    q = property(lambda self: self._e.q[self._r])
+    dq = property(lambda self: self._e.dq[self._r])
+    energy = property(lambda self: float(self._e.energy[self._r]))
+    fatigue = property(lambda self: float(self._e.fatigue[self._r]))
 
 
 class UmbralEnv:
     action_dim = ACTION_DIM
     action_low, action_high = -1.0, 1.0
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, history_id: str | int | None = None):
         self.config = config
-        self.wcfg = config.world
-        self.params = BodyParams.from_config(config.body)
-        self.layout = ObsLayout(self.params.vision_rays)
-        self.observation_dim = self.layout.dim
-        self._template, self.history = build_arena(self.wcfg)
-        self._world_rng: np.random.Generator | None = None
-        self._link_rng: np.random.Generator | None = None
-        self.arena: Arena | None = None
-        self.body: BodyState | None = None
-        self.link: BodyLink | None = None
+        hid = config.world.history_id if history_id is None else history_id
+        self.batch = BatchedUmbralEnv(config, 1, [hid])
+        self.params = self.batch.params
+        self.layout = self.batch.layout
+        self.observation_dim = self.batch.observation_dim
+        self.history = self.batch.histories[0]
+        self.link = BodyLink(self.layout, batch=self.batch.link, row=0)
+        self.body = _BodyView(self.batch, 0)
+
+    # --- live views ------------------------------------------------------------
+
+    @property
+    def arena(self) -> Arena:
+        return self.batch.row_arena(0)
+
+    @property
+    def _limbs(self) -> np.ndarray:
+        return self.batch.limbs[0]
+
+    @property
+    def _raw(self) -> np.ndarray:
+        return self.batch.raw[0]
+
+    @property
+    def steps(self) -> int:
+        return int(self.batch.steps[0])
+
+    @property
+    def world_steps(self) -> int:
+        return int(self.batch.world_steps[0])
+
+    @property
+    def food_eaten_total(self) -> int:
+        return int(self.batch.food_eaten_total[0])
 
     # --- Gymnasium-style API -------------------------------------------------
 
     def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[dict, dict]:
-        if seed is not None:
-            world_ss, link_ss = np.random.SeedSequence(int(seed)).spawn(2)
-            self._world_rng = np.random.default_rng(world_ss)
-            self._link_rng = np.random.default_rng(link_ss)
-        elif self._world_rng is None:
-            raise ValueError("the first reset() needs a seed")
-        self.arena = self._template.copy()
-        self.body = self._start_body()
-        self.link = BodyLink(self.layout, self._link_rng)
-        self.steps = 0
-        self.world_steps = 0
-        self.food_eaten_total = 0
-        self._limbs = limb_points(self.params, self.body.pos, self.body.heading, self.body.q)
-        self._raw = raw_observation(self.params, self.arena, self.body, self._limbs)
-        obs = self.layout.split(self.link.sense(self._raw))
-        return obs, {"history_id": self.history.id, "history_name": self.history.name}
+        obs, _ = self.batch.reset(seed=[seed], options=options)
+        return {k: v[0] for k, v in obs.items()}, {"history_id": self.history.id, "history_name": self.history.name}
 
     def step(self, action: np.ndarray) -> tuple[dict, float, bool, bool, dict[str, Any]]:
-        intended = np.clip(np.asarray(action, dtype=float).reshape(ACTION_DIM), self.action_low, self.action_high)
-        self.link.tick()
-        applied = self.link.act(intended)
-        frozen = bool(self.wcfg.freeze_when_disembodied) and self.link.fully_disconnected()
-
-        eaten, balance, executed = 0, None, np.zeros(ACTION_DIM)
-        if not frozen:
-            executed, effort = move_body(self.params, self.arena, self.body, applied,
-                                         float(self.wcfg.neutral_push_fraction))
-            self._limbs = limb_points(self.params, self.body.pos, self.body.heading, self.body.q)
-            self._tick_food()  # before eating: an item eaten now stays away exactly respawn_steps steps
-            eaten = self._eat()
-            balance = update_energy(self.params, self.body, effort, eaten)
-            self._raw = raw_observation(self.params, self.arena, self.body, self._limbs)
-            self.world_steps += 1
-        self.steps += 1
-        self.food_eaten_total += eaten
-
-        obs = self.layout.split(self.link.sense(self._raw))
-        touch = self._raw[self.layout.slices["touch"]].reshape(self.layout.shapes["touch"])
+        obs, _, _, truncated, b = self.batch.step(np.asarray(action, dtype=float).reshape(1, ACTION_DIM))
+        frozen = bool(b["frozen"][0])
+        bal = b["energy_balance"]
         info = {
-            "action_intended": intended,
-            "action_applied": applied,
-            "action_executed": executed,
-            "void_action": BodyLink.void_action(intended, applied),
+            "action_intended": b["action_intended"][0],
+            "action_applied": b["action_applied"][0],
+            "action_executed": b["action_executed"][0],
+            "void_action": {k: float(v[0]) for k, v in b["void_action"].items()},
             "frozen": frozen,
-            "food_eaten": eaten,
-            "contacts": int((touch[:, 0] > 0).sum()),
-            "energy": self.body.energy,
-            "fatigue": self.body.fatigue,
-            "energy_balance": balance,
-            "step": self.steps,
-            "world_step": self.world_steps,
+            "food_eaten": int(b["food_eaten"][0]),
+            "contacts": int(b["contacts"][0]),
+            "energy": float(b["energy"][0]),
+            "fatigue": float(b["fatigue"][0]),
+            "energy_balance": None if (bal is None or frozen) else {
+                k: float(bal[k][0]) for k in ("before", "basal", "effort_cost", "food_gain", "unclipped", "after")},
+            "step": int(b["step"][0]),
+            "world_step": int(b["world_step"][0]),
         }
-        max_steps = int(self.wcfg.max_steps)
-        truncated = max_steps > 0 and self.steps >= max_steps
-        return obs, 0.0, False, truncated, info
-
-    # --- internals -----------------------------------------------------------
-
-    def _start_body(self) -> BodyState:
-        p, a = self.params, self.arena
-        margin = p.trunk_radius + p.reach + 0.1
-        lo, hi = margin, a.size - margin
-        blockers = [(a.obstacle_pos, a.obstacle_r), (a.neutral_pos, a.neutral_r)]
-        pos = None
-        for _ in range(int(self.wcfg.spawn_tries) * 4):
-            pos = self._world_rng.uniform(lo, hi, size=2)
-            if all(_clear(pos, p.trunk_radius, bp, br, 0.2) for bp, br in blockers):
-                break
-        heading = float(self._world_rng.uniform(-np.pi, np.pi))
-        return BodyState(pos=pos, heading=heading, q=np.zeros((2, 2)), dq=np.zeros((2, 2)),
-                         energy=p.energy_initial, fatigue=0.0)
-
-    def _eat(self) -> int:
-        touched = tip_food_contacts(self.params, self.arena, self._limbs)
-        if len(touched):
-            self.arena.food_active[touched] = False
-            self.arena.food_timer[touched] = int(self.history.cfg.food_respawn_steps)
-        return len(touched)
-
-    def _tick_food(self) -> None:
-        a = self.arena
-        waiting = ~a.food_active
-        if not waiting.any():
-            return
-        a.food_timer[waiting] -= 1
-        trunk = (self.body.pos[None], np.array([self.params.trunk_radius + self.params.reach]))
-        for j in np.flatnonzero(waiting & (a.food_timer <= 0)):
-            a.food_pos[j] = spawn_food_point(self._world_rng, a, self.history, self.wcfg, extra=[trunk])
-            a.food_active[j] = True
-            a.food_timer[j] = 0
+        return {k: v[0] for k, v in obs.items()}, 0.0, False, bool(truncated[0]), info
 
     # --- inspection ----------------------------------------------------------
 
     def snapshot(self) -> dict[str, np.ndarray]:
-        """Physical state for recording and rendering (copies)."""
+        """Physical state for recording and rendering (copies, real objects only)."""
+        a = self.arena
+        touch = self._raw[self.layout.slices["touch"]].reshape(self.layout.shapes["touch"])
         return {
             "trunk_pose": np.array([*self.body.pos, self.body.heading]),
             "limb_points": self._limbs.copy(),
-            "food_pos": self.arena.food_pos.copy(),
-            "food_active": self.arena.food_active.copy(),
-            "neutral_pos": self.arena.neutral_pos.copy(),
-            "touch_intensity": self._raw[self.layout.slices["touch"]].reshape(self.layout.shapes["touch"])[:, 0].copy(),
+            "food_pos": a.food_pos.copy(),
+            "food_active": a.food_active.copy(),
+            "neutral_pos": a.neutral_pos.copy(),
+            "touch_intensity": touch[:, 0].copy(),
         }
 
     def world_state(self) -> dict[str, Any]:
         """Everything that determines the world's future given the same actions."""
-        b = self.body
-        return {
-            "pos": b.pos.copy(), "heading": b.heading, "q": b.q.copy(), "dq": b.dq.copy(),
-            "energy": b.energy, "fatigue": b.fatigue,
-            "food_pos": self.arena.food_pos.copy(), "food_active": self.arena.food_active.copy(),
-            "food_timer": self.arena.food_timer.copy(), "neutral_pos": self.arena.neutral_pos.copy(),
-            "rng": self._world_rng.bit_generator.state, "world_steps": self.world_steps,
-        }
+        return self.batch.world_state(0)
+
+    def get_state(self) -> dict[str, Any]:
+        return self.batch.get_state()
+
+    def set_state(self, state: dict[str, Any]) -> None:
+        self.batch.set_state(state)
 
 
-def _clear(p: np.ndarray, r: float, pos: np.ndarray, rad: np.ndarray, clearance: float) -> bool:
-    if not len(rad):
-        return True
-    return bool((np.sqrt(((pos - p) ** 2).sum(1)) >= rad + r + clearance).all())
-
-
-__all__ = ["UmbralEnv"]
+__all__ = ["UmbralEnv", "BatchedUmbralEnv"]

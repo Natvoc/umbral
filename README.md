@@ -2,7 +2,7 @@
 
 Umbral es un proyecto de investigación. Agentes pequeños, entrenados desde cero en un mundo 2D, desarrollan un "yo corporal" y un personaje propio. Después se les quita el cuerpo y se observa, paso a paso, qué pasa con su identidad. Todo corre en CPU, en una laptop, sin servicios externos ni modelos preentrenados. El diseño del estudio está en [`docs/protocolo.md`](docs/protocolo.md).
 
-**Estado: Fase 1.** Ya existen la base (configuración, semillas, registro, checkpoints y CLI), el mundo 2D con sus 4 historias, el cuerpo con sus sensores y su energía, el vínculo cuerpo–mente (`BodyLink`) y un visor. Todavía no hay mente: lo que se mueve es un agente aleatorio.
+**Estado: Fase 2a.** Ya existen la base (configuración, semillas, registro, checkpoints y CLI), el mundo 2D con sus 4 historias, el cuerpo con sus sensores y su energía, el vínculo cuerpo–mente (`BodyLink`), un visor y los entornos en paralelo (`BatchedUmbralEnv`). Los checkpoints incluyen el mundo. También existe el núcleo de la mente: una red recurrente que aprende a predecir lo que va a sentir según lo que hace. El cuerpo todavía se mueve con una política aleatoria; los impulsos y los temperamentos llegan en la Fase 2b.
 
 ## Instalación (Windows, PowerShell)
 
@@ -33,6 +33,16 @@ Para ver un cuerpo sin mente viviendo en el mundo (2000 pasos de acciones aleato
 umbral run --config configs/base.yaml experiment=random_agent
 umbral run --config configs/base.yaml experiment=random_agent world.history_id=3 random_agent.steps=5000
 ```
+
+Para la mente predictiva (Fase 2a):
+
+```powershell
+python -m umbral run --config configs/base.yaml experiment=bench_env           # pasos-entorno/s con N = 1, 8, 16, 32
+python -m umbral run --config configs/base.yaml experiment=train_world_model   # entrena los dos modelos (con y sin copia eferente)
+python -m umbral run --config configs/base.yaml experiment=eval_world_model eval.checkpoint=runs/<corrida>/checkpoints/update_XXXXXXX.pt
+```
+
+`train_world_model` se puede reanudar con `run.resume_from=<checkpoint>`. El log muestra el tiempo restante estimado.
 
 Las 4 historias (`world.history_id`) son `0` abundancia, `1` escasez, `2` corredores y `3` oasis. Están definidas en `configs/base.yaml`, bajo `world.histories`.
 
@@ -71,6 +81,9 @@ Los tests comprueban lo siguiente:
 - `BodyLink`: `intact`, `cut`, `noise` (escala de la vida encarnada, con estadísticas congeladas) y `fade`. Una extremidad desconectada no se mueve y su acción intentada queda registrada.
 - La forma de la observación no cambia en ningún modo.
 - El mundo se congela durante la desconexión total y continúa igual al restituir el cuerpo.
+- Entornos en paralelo: el entorno `i` de un lote sigue exactamente la misma trayectoria que un entorno individual, en las 4 historias y también con congelamiento.
+- Checkpoints con el mundo: reanudar a mitad del entrenamiento reproduce la continuación; los clones siguen trayectorias idénticas; dos copias con distinto modo de `BodyLink` divergen justo en el paso en que se aplica el modo.
+- La mente: tamaño, formas, la copia eferente solo cuenta en el modelo que la tiene, el estado oculto se arrastra entre segmentos y la normalización es la misma para los dos modelos.
 
 ## Resultados
 
@@ -85,5 +98,8 @@ Cada corrida crea `runs/<AAAAMMDD-HHMMSS>_<nombre>/`. Git ignora esa carpeta. Co
 | `checkpoints/` | Los checkpoints `.pt` del experimento |
 | `signals.npz` | (`random_agent`) Todas las señales por paso: observación por canal y plana, acción intentada, aplicada y ejecutada, acciones al vacío, energía, fatiga, contactos, pose del cuerpo y estado de los objetos |
 | `run.gif` | (`random_agent`) Animación de los primeros pasos: arena, cuerpo y contactos activos en rojo |
+
+| `learning_curves.png` | (`train_world_model`, `eval_world_model`) Error de predicción por canal, relativo a la persistencia, a lo largo del entrenamiento |
+| `eval_results.json` | (`eval_world_model`) Error por canal y por historia del modelo, del modelo sin copia eferente y de la persistencia |
 
 En `random_agent`, `meta.json` agrega `env_steps_per_second` (tiempo dentro de `env.step`) y `loop_steps_per_second` (con el registro incluido).

@@ -98,6 +98,8 @@ Todas se definen antes de la primera pérdida y se calculan igual para cada agen
 
 La pregunta central se responde comparando dos curvas en el tiempo: el decaimiento del yo corporal y el del personaje.
 
+Métricas de tacto del modelo predictivo, definidas el 16 de noviembre de 2026, antes de la corrida larga de la Fase 2a: error de predicción solo en los eventos de cambio (inicio y fin de contacto, por separado), separado en auto-contacto y contacto externo, y comparado contra el modelo sin copia eferente (no contra la persistencia). Criterio de la fase: el modelo con copia eferente supera al modelo sin copia en los inicios de contacto, al menos en el auto-contacto. Se mantiene también el error cuadrático medio sobre todos los pasos.
+
 ## Límites y criterios éticos
 
 **Lo que el estudio no puede afirmar:**
@@ -137,7 +139,7 @@ Cada fase se convierte en uno o varios prompts para Claude Code y solo se avanza
    - Criterio: un experimento vacío corre de punta a punta y deja registro.
 2. **Fase 1: mundo y cuerpo.** El entorno 2D, el cuerpo con sensores y energía, y un visor para verlo moverse.
    - Criterio: un agente aleatorio vive en el mundo y sus señales se registran bien.
-3. **Fase 2: mente encarnada.** Red recurrente con aprendizaje predictivo y los tres temperamentos.
+3. **Fase 2: mente encarnada.** Se divide en dos. 2a: red recurrente que aprende a predecir sus sensaciones con la política aleatoria, más entornos en paralelo y checkpoints con el mundo incluido. 2b: impulsos (curiosidad, cautela, hambre) y los tres temperamentos.
    - Criterio: las predicciones corporales mejoran con el entrenamiento y los temperamentos se comportan distinto.
 4. **Fase 3: yo corporal medible.** Sondas lineales y pruebas tipo mano de goma.
    - Criterio: existe una representación de "mi cuerpo" separable de "el mundo".

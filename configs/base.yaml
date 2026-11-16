@@ -117,3 +117,37 @@ random_agent:
   gif_steps: 300                # first N steps rendered to run.gif
   gif_stride: 2
   gif_fps: 15
+
+# ----------------------------------------------------------------------------
+# Phase 2a: predictive mind.
+# ----------------------------------------------------------------------------
+mind:
+  encoder: 128                  # Linear(obs + previous action -> encoder), ReLU
+  hidden: 256                   # GRU hidden size
+  head_hidden: 128              # prediction head: Linear(hidden + action -> head_hidden), ReLU, Linear
+
+train:
+  n_envs: 16                    # environments simulated in parallel (histories cycle 0,1,2,3,...)
+  seq_len: 32                   # truncated BPTT segment length (steps)
+  episode_steps: 1024           # each environment restarts with a new seed after this many steps (staggered)
+  updates: 2000                 # training updates (one update = seq_len steps of every environment)
+  lr: 0.001
+  grad_clip: 1.0
+  log_every: 25                 # updates between metric lines
+  checkpoint_every: 500         # updates between checkpoints (multiple of log_every)
+  smoothing: 0.9                # OU policy, as in random_agent
+  scale: 0.8
+  ckpt_eval_envs_per_history: 2 # light evaluation at every checkpoint, fixed seeds
+  ckpt_eval_steps: 1000
+  norm_envs: 16                 # warm-up for the frozen normalization of target changes
+  norm_steps: 2000
+
+eval:
+  checkpoint: null              # path to a train_world_model checkpoint (.pt)
+  envs_per_history: 4
+  steps: 2000
+  chunk: 64
+
+bench:
+  sizes: [1, 8, 16, 32]
+  seconds: 3.0

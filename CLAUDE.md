@@ -32,21 +32,37 @@ Umbral estudia agentes pequeños entrenados desde cero en un mundo 2D: cómo des
 - La acción intentada se registra siempre. Las acciones al vacío son una métrica central.
 - La forma de la observación (107 valores) es fija y está documentada en `src/umbral/body/sensors.py`. Cambiarla rompe la comparación entre agentes: no se cambia sin decidirlo de forma explícita.
 - Los parámetros de fatiga en `base.yaml` son **provisionales**, todavía sin calibrar.
-- Pendiente para la Fase 2: el estado del entorno (cuerpo, arena, generadores del mundo y del link, estadísticas del link) tiene que entrar en los checkpoints, con su test de reanudación.
+- Los checkpoints (formato v2) incluyen el mundo completo (`env`), la política (`policy`) y el estado de la mente (`mind_state`). Todo estado nuevo que afecte la trayectoria tiene que entrar ahí, con su test.
+
+## Entornos en paralelo
+
+- `BatchedUmbralEnv` es la única implementación de la física y los sensores; `UmbralEnv` es un lote de tamaño 1.
+- **Equivalencia exacta**: el entorno `i` de un lote debe dar la misma trayectoria que uno individual (`tests/test_batched.py`). En los núcleos en lote: solo operaciones elemento a elemento y reducciones sobre el último eje; nada de multiplicación de matrices ni de reducciones sobre el eje del lote. Los objetos se rellenan hasta una capacidad fija. Toda optimización se valida con ese test.
+- Cada entorno tiene sus propios generadores (mundo, vínculo, política). Nunca se comparte un generador entre entornos.
+
+## La mente (Fase 2a)
+
+- La GRU recibe `[o_t, a_{t-1}]` y la cabeza recibe `[h_t, a_t]` (documentado en `src/umbral/mind/model.py`). Siempre se usa la acción **intentada**, nunca la aplicada.
+- El modelo sin copia eferente es idéntico, pero con acciones en cero. Los dos se entrenan juntos, con los mismos datos y los mismos pesos iniciales, sin compartir parámetros, optimizadores ni gradientes. La política no depende de nada aprendido.
+- Las desviaciones estándar que normalizan los cambios se estiman una sola vez (calentamiento con semilla fija), se congelan y se guardan en el `state_dict`. Son las mismas para los dos modelos.
+- Semillas disjuntas: entrenamiento en `[0, 2**31)`, evaluación desde `2**31` y normalización desde `2**32`.
 
 ## Fases
 
 - **Ninguna fase avanza sin cumplir su criterio de cierre**, verificado con comandos y tests, no por suposición.
 - Fase 0 (base del repositorio): cerrada cuando `umbral run --config configs/base.yaml experiment=noop` deja una carpeta completa en `runs/` y `pytest` pasa.
 - Fase 1 (mundo y cuerpo): cerrada cuando `umbral run --config configs/base.yaml experiment=random_agent` deja métricas, `signals.npz` y `run.gif`, y todos los tests pasan.
+- Fase 2a (modelo predictivo): equivalencia del lote probada y rendimiento registrado; reanudar y clonar con el mundo probado; una corrida completa de `train_world_model`; en la evaluación, el modelo supera claramente a la persistencia en todos los canales, y al modelo sin copia eferente al menos en propiocepción y tacto; todos los tests pasan.
+- Las corridas largas (de horas) no se lanzan sin el visto bueno de la investigadora.
 - En esta laptop, `umbral.exe` está bloqueado por Smart App Control: se usa `python -m umbral ...`, que es equivalente.
 
 ## Estructura
 
 - `src/umbral/`: `config`, `seeding`, `recorder`, `checkpoint` y `cli`.
 - `src/umbral/experiments/`: experimentos registrados con `@register("nombre")`.
-- `world/`: `arena` (geometría y objetos), `histories` (las 4 historias), `env` (`UmbralEnv`, al estilo Gymnasium) y `render` (visor y GIF).
+- `world/`: `arena` (geometría en lote y objetos), `histories` (las 4 historias), `batched` (`BatchedUmbralEnv`), `env` (`UmbralEnv`, al estilo Gymnasium) y `render` (visor y GIF).
 - `body/`: `body` (cinemática, movimiento, energía y fatiga), `sensors` (sensores y distribución de la observación) y `link` (`BodyLink`).
-- `mind/` y `metrics/`: se llenan en fases posteriores.
+- `mind/`: `model` (mente predictiva), `policy` (política OU), `training` y `report` (curvas y orden de aprendizaje).
+- `metrics/`: se llena en fases posteriores.
 - `configs/base.yaml`: toda clave que se pueda sobrescribir desde la CLI tiene que existir aquí.
 - `tests/`: `pytest`.

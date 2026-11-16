@@ -37,8 +37,8 @@ class History:
     patch_centers: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
 
 
-def get_history(world_cfg: Config) -> History:
-    hid = str(world_cfg.history_id)
+def get_history(world_cfg: Config, history_id: str | int | None = None) -> History:
+    hid = str(world_cfg.history_id if history_id is None else history_id)
     try:
         h = world_cfg.histories[hid]
     except KeyError:
@@ -86,9 +86,9 @@ def _corridor_walls(size: float, rng: np.random.Generator) -> tuple[np.ndarray, 
     return pos, np.full(len(pos), CORRIDOR_RADIUS)
 
 
-def build_arena(world_cfg: Config) -> tuple[Arena, History]:
-    """Deterministic initial arena for the configured history."""
-    hist = get_history(world_cfg)
+def build_arena(world_cfg: Config, history_id: str | int | None = None) -> tuple[Arena, History]:
+    """Deterministic initial arena for a history (default: ``world.history_id``)."""
+    hist = get_history(world_cfg, history_id)
     h = hist.cfg
     size = float(world_cfg.size)
     tries = int(world_cfg.spawn_tries)
