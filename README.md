@@ -2,7 +2,7 @@
 
 Umbral es un proyecto de investigación. Agentes pequeños, entrenados desde cero en un mundo 2D, desarrollan un "yo corporal" y un personaje propio. Después se les quita el cuerpo y se observa, paso a paso, qué pasa con su identidad. Todo corre en CPU, en una laptop, sin servicios externos ni modelos preentrenados. El diseño del estudio está en [`docs/protocolo.md`](docs/protocolo.md).
 
-**Estado: Fase 2a cerrada; sigue la Fase 2b.** Ya existen la base (configuración, semillas, registro, checkpoints y CLI), el mundo 2D con sus 4 historias, el cuerpo con sus sensores y su energía, el vínculo cuerpo–mente (`BodyLink`), un visor y los entornos en paralelo (`BatchedUmbralEnv`). Los checkpoints incluyen el mundo. También existe el núcleo de la mente: una red recurrente que aprende a predecir lo que va a sentir según lo que hace. El cuerpo todavía se mueve con una política aleatoria; los impulsos y los temperamentos llegan en la Fase 2b.
+**Estado: Fase 2b en curso.** Ya existen la base (configuración, semillas, registro, checkpoints y CLI), el mundo 2D con sus 4 historias, el cuerpo con sus sensores y su energía, el vínculo cuerpo–mente (`BodyLink`), un visor y los entornos en paralelo (`BatchedUmbralEnv`). Los checkpoints incluyen el mundo. La mente tiene un modelo predictivo (Fase 2a) que aprende a anticipar lo que va a sentir según lo que hace. En la Fase 2b el agente empieza a decidir: un actor y un crítico leen el estado del modelo predictivo, guiados por tres impulsos internos (hambre, curiosidad y cautela), cuyos pesos definen tres temperamentos.
 
 ## Instalación (Windows, PowerShell)
 
@@ -44,6 +44,20 @@ python -m umbral run --config configs/base.yaml experiment=eval_world_model eval
 
 `train_world_model` se puede reanudar con `run.resume_from=<checkpoint>`. El log muestra el tiempo restante estimado.
 
+Para la mente que decide (Fase 2b):
+
+```powershell
+python -m umbral run --config configs/base.yaml experiment=live_agent agent.temperament=curioso agent.history=0 seed=1
+python -m umbral run --config configs/base.yaml experiment=behavior_battery behavior.checkpoint=runs/<vida>/checkpoints/life_long.pt
+python -m umbral run --config configs/base.yaml experiment=agent_report "report.agents=[runs/<vida1>, runs/<vida2>]"
+python -m umbral run --config configs/base.yaml experiment=train_population population.max_agents=6
+```
+
+- **`live_agent`:** una vida propia, que parte de la infancia común (`agent.infancy`, el modelo final de la 2a). Guarda `life_short.pt` a la mitad, `life_long.pt` al final y checkpoints intermedios para reanudar. Al terminar, deja `behavior.json` (la batería) y `prediction_check.json` (el modelo predictivo del agente frente al de la infancia).
+- **`agent_report`:** compara agentes, con medias e intervalos por bootstrap, g de Hedges entre pares, `behavior.png` y `life_curves.png`.
+- **`train_population`:** pone en cola los 36 agentes en una carpeta fija (`population.dir`) con su índice `population.json`. Se puede reanudar: salta los agentes terminados y retoma los interrumpidos desde su último checkpoint. `population.max_agents` limita cuántos corren por sesión y `population.parallel`, cuántos a la vez.
+- **Regla ética:** si un agente pasa más del 10 % de su vida (después del 5 % inicial) con energía bajo 0,1, su vida se detiene con `life_status: flagged` y deja `flagged_summary.json`. En la población se detiene toda la cola.
+
 Las 4 historias (`world.history_id`) son `0` abundancia, `1` escasez, `2` corredores y `3` oasis. Están definidas en `configs/base.yaml`, bajo `world.histories`.
 
 Cualquier valor de `configs/base.yaml` se puede sobrescribir con `clave=valor`, usando puntos para las secciones:
@@ -84,6 +98,14 @@ Los tests comprueban lo siguiente:
 - Entornos en paralelo: el entorno `i` de un lote sigue exactamente la misma trayectoria que un entorno individual, en las 4 historias y también con congelamiento.
 - Checkpoints con el mundo: reanudar a mitad del entrenamiento reproduce la continuación; los clones siguen trayectorias idénticas; dos copias con distinto modo de `BodyLink` divergen justo en el paso en que se aplica el modo.
 - La mente: tamaño, formas, la copia eferente solo cuenta en el modelo que la tiene, el estado oculto se arrastra entre segmentos y la normalización es la misma para los dos modelos.
+- La mente que decide: el gradiente de PPO no llega al GRU, al codificador ni a la cabeza de predicción; la log-probabilidad de la gaussiana con tanh es correcta.
+- Los impulsos coinciden con casos calculados a mano (hambre, cautela con la acción intentada, curiosidad solo con visión y tacto externo, pesos del temperamento); la escala común de la recompensa es la desviación estándar del retorno.
+- La infancia protegida escala el costo de vivir según el calendario.
+- Reanudar a mitad de una vida reproduce exactamente la continuación (mente, política, optimizadores, mundos, impulsos y normalizador).
+- La regla ética detiene la vida y deja su resumen.
+- La sonda de la batería respeta la equivalencia del lote.
+- `train_population` salta los agentes terminados y retoma los interrumpidos desde su checkpoint.
+- Los intervalos de confianza por bootstrap contienen la estimación y son reproducibles.
 
 ## Resultados
 
@@ -109,26 +131,28 @@ Corrida de referencia: `runs/20261116-152329_fase2a` (commit `332a6fa`, sin camb
 
 Rendimiento de `BatchedUmbralEnv` (pasos de entorno por segundo): 791 con N=1, 4.574 con N=8, 7.525 con N=16 y 10.305 con N=32.
 
-Evaluación (`runs/20261117-060656_fase2a_eval`) del checkpoint `update_0098000.pt`, con semillas no vistas en el entrenamiento: 4 entornos por historia y 2.000 pasos cada uno. Error cuadrático medio por canal:
+Evaluación (`runs/20261117-080216_fase2a_eval_ci`) del checkpoint `update_0098000.pt`, con semillas no vistas en el entrenamiento: 16 entornos por historia (64 semillas) y 2.000 pasos cada uno; tardó 23 s. Los intervalos de confianza del 95 % salen de un bootstrap estratificado por historia sobre las semillas de evaluación (10.000 remuestras). Error cuadrático medio por canal:
 
-| Canal | Con copia eferente | Sin copia eferente | Persistencia | Con copia / persistencia | Con copia / sin copia |
+| Canal | Con copia eferente | Sin copia eferente | Persistencia | Con copia / persistencia (IC 95 %) | Con copia / sin copia (IC 95 %) |
 |---|---|---|---|---|---|
-| Propiocepción | 2,91e-3 | 1,63e-2 | 2,06e-2 | 0,14 | 0,18 |
-| Tacto | 4,72e-3 | 5,37e-3 | 7,76e-3 | 0,61 | 0,88 |
-| Visión | 1,71e-2 | 2,05e-2 | 3,29e-2 | 0,52 | 0,84 |
-| Interocepción | 2,47e-5 | 2,52e-5 | 3,34e-5 | 0,74 | 0,98 |
+| Propiocepción | 3,11e-3 | 1,55e-2 | 1,93e-2 | 0,16 [0,15; 0,17] | 0,20 [0,19; 0,22] |
+| Tacto | 4,48e-3 | 5,07e-3 | 7,14e-3 | 0,63 [0,61; 0,64] | 0,88 [0,87; 0,89] |
+| Visión | 1,61e-2 | 1,88e-2 | 2,93e-2 | 0,55 [0,53; 0,57] | 0,86 [0,84; 0,87] |
+| Interocepción | 2,25e-5 | 2,33e-5 | 3,16e-5 | 0,71 [0,65; 0,78] | 0,97 [0,95; 0,98] |
 
 Error en los eventos de tacto (cociente con copia / sin copia):
 
-| Evento | Casos | Con copia / sin copia |
+| Evento | Casos | Con copia / sin copia (IC 95 %) |
 |---|---|---|
-| Inicio de contacto | 4.397 | 0,86 |
-| Inicio de auto-contacto | 1.354 | 0,68 |
-| Inicio de contacto externo | 3.043 | 0,90 |
-| Fin de contacto | 4.393 | 0,80 |
-| Fin de auto-contacto | 1.336 | 0,68 |
-| Fin de contacto externo | 3.057 | 0,83 |
+| Inicio de contacto | 16.223 | 0,85 [0,84; 0,86] |
+| Inicio de auto-contacto | 5.132 | 0,67 [0,65; 0,69] |
+| Inicio de contacto externo | 11.091 | 0,89 [0,89; 0,90] |
+| Fin de contacto | 16.163 | 0,80 [0,79; 0,81] |
+| Fin de auto-contacto | 5.092 | 0,67 [0,64; 0,69] |
+| Fin de contacto externo | 11.071 | 0,83 [0,82; 0,84] |
 
-Se cumplen los criterios de cierre. El modelo con copia eferente supera a la persistencia en todos los canales y al modelo sin copia en los cuatro. La ventaja es mayor en propiocepción y en los eventos de auto-contacto, que es donde saber lo que uno hace sirve para anticipar lo que va a sentir. Al principio del entrenamiento (actualización 5.000), el modelo con copia predecía el inicio del auto-contacto un poco peor que el modelo sin copia (cociente 1,03); esa ventaja se construyó con el entrenamiento. Las figuras están en la carpeta de la evaluación: `learning_curves.png` y `checkpoint_eval_curves.png`.
+La primera evaluación de cierre (`runs/20261117-060656_fase2a_eval`, 4 semillas por historia) dio valores compatibles, por ejemplo 0,68 en el inicio del auto-contacto.
+
+Se cumplen los criterios de cierre. El modelo con copia eferente supera a la persistencia en todos los canales y al modelo sin copia en los cuatro; ningún intervalo de confianza toca el 1. La ventaja es mayor en propiocepción y en los eventos de auto-contacto, que es donde saber lo que uno hace sirve para anticipar lo que va a sentir. Al principio del entrenamiento (actualización 5.000), el modelo con copia predecía el inicio del auto-contacto un poco peor que el modelo sin copia (cociente 1,03); esa ventaja se construyó con el entrenamiento. Las figuras están en la carpeta `runs/20261117-060656_fase2a_eval`: `learning_curves.png` y `checkpoint_eval_curves.png`.
 
 Una primera corrida (`runs/20261116-141605_fase2a`) se interrumpió al apagarse la laptop, antes del primer checkpoint. Quedó marcada como `interrupted` y no se cita.

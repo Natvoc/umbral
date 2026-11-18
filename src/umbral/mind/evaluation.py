@@ -35,6 +35,12 @@ SELF_COL = 1 + SELF  # column of the "self" one-hot in a touch row
 def touch_event_sq_error(layout: ObsLayout, cur: torch.Tensor, nxt: torch.Tensor, pred: torch.Tensor
                          ) -> dict[str, tuple[float, int]]:
     """Per event type: (sum of per-sensor-step errors, number of sensor-steps)."""
+    return {k: (float(s.sum()), int(c.sum())) for k, (s, c) in touch_event_sq_error_rows(layout, cur, nxt, pred).items()}
+
+
+def touch_event_sq_error_rows(layout: ObsLayout, cur: torch.Tensor, nxt: torch.Tensor, pred: torch.Tensor
+                              ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Per event type: (per-row sums of per-sensor-step errors, per-row counts); rows = leading axis."""
     sl = layout.slices["touch"]
     lead = cur.shape[:-1]
     c = cur[..., sl].reshape(*lead, N_TOUCH, TOUCH_WIDTH).double()
@@ -48,14 +54,30 @@ def touch_event_sq_error(layout: ObsLayout, cur: torch.Tensor, nxt: torch.Tensor
         "onset": onset, "onset_self": onset & self_next, "onset_external": onset & ~self_next,
         "offset": offset, "offset_self": offset & self_cur, "offset_external": offset & ~self_cur,
     }
-    return {k: (float(err[m].sum()), int(m.sum())) for k, m in masks.items()}
+    b = cur.shape[0]
+    return {k: ((err * m).reshape(b, -1).sum(1).numpy(), m.reshape(b, -1).sum(1).numpy())
+            for k, m in masks.items()}
+
+
+def channel_sq_error_rows(layout: ObsLayout, pred: torch.Tensor, target: torch.Tensor
+                          ) -> dict[str, tuple[np.ndarray, int]]:
+    """Per channel: (per-row sums of squared errors, elements per row); rows = leading axis."""
+    b = pred.shape[0]
+    out = {}
+    for ch in CHANNELS:
+        d = pred[..., layout.slices[ch]].double() - target[..., layout.slices[ch]].double()
+        out[ch] = ((d * d).reshape(b, -1).sum(1).numpy(), d[0].numel())
+    return out
 
 
 def evaluate(models: Mapping[str, WorldModel], config: Config, histories: list[str], seeds: list[int],
              policy_seeds: list[int], steps: int, chunk: int) -> dict:
     """Run the OU policy on fixed seeds; accumulate errors of each model and of persistence.
 
-    Returns ``{"mse": {pred: {history: {channel: [sum, n]}}}, "touch": {pred: {event: [sum, n]}}}``.
+    Returns ``{"mse": {pred: {history: {channel: [sum, n]}}}, "touch": {pred: {event: [sum, n]}},
+    "rows": {...}}``. ``rows`` keeps the same sums per environment (one evaluation seed each):
+    ``rows["mse"][pred][channel]`` and ``rows["touch"][model][event]`` are ``(n_envs, 2)`` arrays
+    of [sum, count], used for the bootstrap over seeds; ``rows["histories"]`` labels the rows.
     Pure with respect to the models and the global RNGs (own env, own generators, no grad).
     """
     n = len(histories)
@@ -66,10 +88,8 @@ def evaluate(models: Mapping[str, WorldModel], config: Config, histories: list[s
     h = {k: m.initial_state(n) for k, m in models.items()}
     prev_action = np.zeros((n, 6))
     predictors = (*models, "persistence")
-    hids = sorted(set(histories))
-    rows_of = {hid: np.array([i for i, x in enumerate(histories) if x == hid]) for hid in hids}
-    mse = {p: {hid: {c: [0.0, 0] for c in CHANNELS} for hid in hids} for p in predictors}
-    touch = {p: {e: [0.0, 0] for e in TOUCH_EVENTS} for p in models}
+    mse_rows = {p: {c: np.zeros((n, 2)) for c in CHANNELS} for p in predictors}
+    touch_rows = {p: {e: np.zeros((n, 2)) for e in TOUCH_EVENTS} for p in models}
     done = 0
     while done < steps:
         T = min(chunk, steps - done)
@@ -91,16 +111,66 @@ def evaluate(models: Mapping[str, WorldModel], config: Config, histories: list[s
                 out = m(cur, pa, aa, h[k])
                 h[k] = out.h_last
                 preds[k] = m.predict_next(cur, out)
-                for e, (s, cnt) in touch_event_sq_error(env.layout, cur, nxt, preds[k]).items():
-                    touch[k][e][0] += s
-                    touch[k][e][1] += cnt
+                for e, (s, cnt) in touch_event_sq_error_rows(env.layout, cur, nxt, preds[k]).items():
+                    touch_rows[k][e][:, 0] += s
+                    touch_rows[k][e][:, 1] += cnt
         for p, pred in preds.items():
-            for hid, rows in rows_of.items():
-                for c, (s, cnt) in channel_sq_error(env.layout, pred[rows], nxt[rows]).items():
-                    mse[p][hid][c][0] += s
-                    mse[p][hid][c][1] += cnt
+            for c, (s, cnt) in channel_sq_error_rows(env.layout, pred, nxt).items():
+                mse_rows[p][c][:, 0] += s
+                mse_rows[p][c][:, 1] += cnt
         done += T
-    return {"mse": mse, "touch": touch}
+    hids = sorted(set(histories))
+    rows_of = {hid: np.array([i for i, x in enumerate(histories) if x == hid]) for hid in hids}
+    mse = {p: {hid: {c: [float(mse_rows[p][c][r, 0].sum()), int(mse_rows[p][c][r, 1].sum())]
+                     for c in CHANNELS} for hid, r in rows_of.items()} for p in predictors}
+    touch = {p: {e: [float(v[:, 0].sum()), int(v[:, 1].sum())] for e, v in ev.items()}
+             for p, ev in touch_rows.items()}
+    return {"mse": mse, "touch": touch,
+            "rows": {"mse": mse_rows, "touch": touch_rows, "histories": list(histories)}}
+
+
+def bootstrap_ratio_ci(num: np.ndarray, den: np.ndarray, histories: list[str], n_boot: int, seed: int,
+                       level: float = 0.95) -> tuple[float, float]:
+    """Percentile CI of ``mean(num) / mean(den)`` resampling evaluation seeds within each history.
+
+    ``num`` and ``den`` are ``(n_envs, 2)`` [sum, count] arrays over the same rows (seeds). Each
+    resample draws, inside every history, as many rows as it has, with replacement (stratified
+    bootstrap), and recomputes both pooled means from the drawn rows.
+    """
+    rng = np.random.default_rng(seed)
+    hist = np.asarray(histories)
+    idx = np.concatenate([rng.choice(np.flatnonzero(hist == h), size=(n_boot, int((hist == h).sum())))
+                          for h in sorted(set(histories))], axis=1)
+    ns, nc = num[idx, 0].sum(1), num[idx, 1].sum(1)
+    ds, dc = den[idx, 0].sum(1), den[idx, 1].sum(1)
+    ok = (nc > 0) & (dc > 0) & (ds > 0)
+    if not ok.any():
+        return float("nan"), float("nan")
+    r = (ns[ok] / nc[ok]) / (ds[ok] / dc[ok])
+    a = (1 - level) / 2
+    return float(np.quantile(r, a)), float(np.quantile(r, 1 - a))
+
+
+def ratio_cis(sums: dict, n_boot: int = 10_000, seed: int = 0) -> dict:
+    """95 % bootstrap CIs for every ratio of the evaluation tables.
+
+    ``mse``: efference/persistence and efference/no_efference per channel; ``touch_events``:
+    efference/no_efference per event.
+    """
+    rows, hist = sums["rows"], sums["rows"]["histories"]
+    out = {"n_boot": n_boot, "seed": seed, "level": 0.95, "mse": {}, "touch_events": {}}
+    for c in CHANNELS:
+        m = rows["mse"]
+        out["mse"][c] = {
+            "efference/persistence": bootstrap_ratio_ci(m["efference"][c], m["persistence"][c], hist, n_boot, seed),
+            "efference/no_efference": bootstrap_ratio_ci(m["efference"][c], m["no_efference"][c], hist, n_boot,
+                                                         seed),
+        }
+    for e in TOUCH_EVENTS:
+        t = rows["touch"]
+        out["touch_events"][e] = {"efference/no_efference": bootstrap_ratio_ci(
+            t["efference"][e], t["no_efference"][e], hist, n_boot, seed)}
+    return out
 
 
 def summarize(sums: dict) -> dict:

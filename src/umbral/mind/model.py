@@ -127,17 +127,29 @@ class WorldModel(nn.Module):
             action = torch.zeros_like(action)
         x = F.relu(self.encoder(torch.cat([obs, prev_action], dim=-1)))
         hidden, h_last = self.gru(x, h0)
+        return self.from_hidden(obs, hidden, action, h_last)
+
+    def from_hidden(self, obs: torch.Tensor, hidden: torch.Tensor, action: torch.Tensor,
+                    h_last: torch.Tensor | None = None) -> WorldModelOutput:
+        """The prediction head alone, on given hidden states ``h_t`` (B,T,H) and actions ``a_t``."""
+        if not self.efference_copy:
+            action = torch.zeros_like(action)
         y = self.head(torch.cat([hidden, action], dim=-1))
         B, T = obs.shape[:2]
         n_reg, R = self.out_layout.n_reg, self.out_layout.n_rays
         n_touch = N_TOUCH * TOUCH_WIDTH
         t_cls, v_cls = self._types(obs)
-        touch_logits = y[..., n_reg:n_reg + n_touch].reshape(B, T, N_TOUCH, TOUCH_WIDTH) \
-            + self.touch_skip * F.one_hot(t_cls, TOUCH_WIDTH).to(y.dtype)
-        vision_logits = y[..., n_reg + n_touch:].reshape(B, T, R, VISION_WIDTH) \
-            + self.vision_skip * F.one_hot(v_cls, VISION_WIDTH).to(y.dtype)
+        touch_logits = y[..., n_reg:n_reg + n_touch].reshape(B, T, N_TOUCH, TOUCH_WIDTH)             + self.touch_skip * F.one_hot(t_cls, TOUCH_WIDTH).to(y.dtype)
+        vision_logits = y[..., n_reg + n_touch:].reshape(B, T, R, VISION_WIDTH)             + self.vision_skip * F.one_hot(v_cls, VISION_WIDTH).to(y.dtype)
         return WorldModelOutput(reg=y[..., :n_reg], touch_logits=touch_logits, vision_logits=vision_logits,
-                                hidden=hidden, h_last=h_last)
+                                hidden=hidden, h_last=h_last if h_last is not None else hidden[:, -1:].transpose(0, 1))
+
+    def step_hidden(self, obs: torch.Tensor, prev_action: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """One recurrent step: ``h_t`` (1,B,H) from ``o_t`` (B,107), ``a_{t-1}`` (B,6) and ``h_{t-1}``."""
+        if not self.efference_copy:
+            prev_action = torch.zeros_like(prev_action)
+        x = F.relu(self.encoder(torch.cat([obs, prev_action], dim=-1)))[:, None]
+        return self.gru(x, h)[1]
 
     # --- targets, losses, predictions ------------------------------------------------
 

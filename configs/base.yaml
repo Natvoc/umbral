@@ -99,7 +99,7 @@ body:
   vision_range: 3.0
   energy:
     initial: 1.0
-    basal: 0.0004               # metabolic cost per step
+    basal: 0.0002               # metabolic cost per step (0.0004 until 17 Nov 2026; see docs/protocolo.md)
     effort_cost: 0.0016         # extra cost per step at maximal effort (effort = mean squared executed action)
     food_value: 0.25
     low_threshold: 0.2          # below this energy, strength scales down linearly ...
@@ -144,10 +144,93 @@ train:
 
 eval:
   checkpoint: null              # path to a train_world_model checkpoint (.pt)
-  envs_per_history: 4
+  envs_per_history: 16          # one evaluation seed per environment
   steps: 2000
   chunk: 64
+  n_boot: 10000                 # bootstrap resamples (over seeds, stratified by history) for the 95% CIs
+  bootstrap_seed: 0
+  physics: trained              # trained: world and body as in the checkpoint; current: as in this config
 
 bench:
   sizes: [1, 8, 16, 32]
   seconds: 3.0
+
+# ----------------------------------------------------------------------------
+# Phase 2b: drives, temperaments and the agent's own life.
+# Every weight and scale below is PROVISIONAL, to be calibrated in the pilot.
+# ----------------------------------------------------------------------------
+temperaments:                   # weights of curiosity and caution; hunger weighs 1 for everyone
+  curioso: {curiosity: 1.0, caution: 0.25}
+  cauteloso: {curiosity: 0.2, caution: 1.0}
+  equilibrado: {curiosity: 0.5, caution: 0.5}
+
+drives:
+  set_point: 0.8                # E*: hunger is D(E) = (E* - E)^2, reward D(E_t) - D(E_t+1)
+  hunger_scale: 100.0          # 10 until 17 Nov: the agent learned to stay still instead of eating
+  curiosity_scale: 0.03         # curiosity = world-facing prediction error / its running mean
+  curiosity_ema: 0.01           # rate of that running mean (per rollout)
+  caution_scale: 100.0          # caution = -caution_scale * effort_cost * mean(a_t^2)
+
+agent:
+  temperament: equilibrado      # key into temperaments
+  history: 0                    # the agent lives in one history (all its parallel bodies)
+  infancy: runs/20261116-152329_fase2a/checkpoints/update_0098000.pt  # common childhood (Phase 2a)
+  width: 128                    # actor and critic MLP width
+  init_log_std: -0.5
+
+life:
+  n_envs: 32
+  rollout: 128                  # steps per environment per iteration
+  iterations: 3600              # length of the life (iterations); life_short.pt at half, life_long.pt at the end
+  episode_steps: 4096           # each body restarts (new seed, full energy) after this many steps, staggered
+  world_lr: 0.0003              # the self-model keeps learning (prediction loss only)
+  seq_len: 32                   # TBPTT segment of the predictor
+  grad_clip: 1.0
+  log_every: 10
+  checkpoint_every: 50          # resumable checkpoints (multiple of log_every)
+  stop_at: null                 # stop (paused, resumable) after this iteration; null = live to the end
+  protected_infancy:            # the cost of living (basal + effort) starts lower and rises linearly ...
+    start_factor: 0.25          # ... from this factor ...
+    fraction: 0.2               # ... to 1 over this share of the life (the same for every agent and history)
+  run_report: true              # behaviour battery and prediction check at the end of the life
+
+ppo:
+  lr: 0.0003
+  epochs: 4
+  minibatches: 4
+  clip: 0.2
+  gamma: 0.995                  # horizon ~200 steps: food is often farther than 100 steps
+  lam: 0.95
+  vf_coef: 0.5
+  ent_coef: 0.001               # keeps the policy from collapsing into stillness
+  grad_clip: 0.5
+
+ethics:                         # aversive signals at the minimum; see docs/protocolo.md
+  low_energy: 0.1               # energy below this counts as "very low"
+  max_low_fraction: 0.10        # more than this share of the life (after warm-up) at very low energy: stop
+  warmup_fraction: 0.05         # share of the life before the check starts
+
+behavior:                       # pre-specified behaviour battery (seeds from BEHAVIOR_SEED_BASE)
+  checkpoint: null              # agent checkpoint for experiment=behavior_battery
+  episodes: 8
+  steps: 4000
+  grid: 1.0                     # cell side for the covered area
+  probe_every: 500              # a neutral object appears ahead every this many steps ...
+  probe_offset: 250             # ... starting at this step
+  probe_distance: 2.0
+  probe_window: 50              # steps observed after it appears
+  probe_threshold: 0.3          # distance change that counts as approaching / moving away
+  n_boot: 10000
+
+report:                         # experiment=agent_report: compare agents
+  agents: []                    # list of agent run directories
+  baseline: null                # infancy checkpoint for the prediction check (default: the agents' infancy)
+
+population:
+  dir: runs/population          # fixed folder: population.json and one subfolder per agent
+  temperaments: [curioso, cauteloso, equilibrado]
+  histories: ["0", "1", "2", "3"]
+  seeds: [0, 1, 2]
+  max_agents: null              # agents to run in this session (null = all pending)
+  parallel: 1                   # agents run at once (processes)
+  overrides: []                 # extra overrides passed to every agent run

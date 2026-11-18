@@ -49,6 +49,17 @@ Un mundo 2D sencillo y totalmente controlado; lo que importa es la relación del
 
 Las señales aversivas (perder energía) se mantienen en la intensidad mínima necesaria para que el agente aprenda.
 
+**Cambios en la física de la energía (17 de noviembre de 2026, Fase 2b).**
+
+- **Metabolismo basal:** baja de 0,0004 a 0,0002 por paso. El gasto por esfuerzo (0,0016 al esfuerzo máximo) y el valor de la comida (0,25) no cambian.
+- **Infancia protegida:** el costo de vivir (basal más esfuerzo) empieza en el 25 % de su valor y sube de forma lineal hasta el 100 % durante el primer 20 % de la vida propia de cada agente.
+  - Así el agente aprende a comer mientras el hambre todavía aprieta poco.
+  - Es igual para todos los agentes y para las 4 historias.
+  - El metabolismo efectivo de cada paso se registra en las métricas.
+  - Los parámetros están en `configs/base.yaml` (`body.energy.basal`, `life.protected_infancy`).
+- **Por qué hacen falta las dos medidas:** un agente que todavía no sabe comer pasa entre el 12 y el 16 % de su tiempo con energía bajo 0,1 aun con el metabolismo basal en 0, porque el gasto por esfuerzo pesa más que el basal.
+- **Línea base:** el modelo de la Fase 2a se volvió a evaluar con la física nueva, sin reentrenar y con el mismo protocolo (`runs/20261117-085233_fase2a_eval_fisica_nueva`). Esa evaluación es la referencia para el criterio "el error de predicción no empeora".
+
 ## La mente
 
 Una red recurrente pequeña, de cientos de miles de parámetros, entrenada desde cero en CPU.
@@ -58,11 +69,18 @@ Una red recurrente pequeña, de cientos de miles de parámetros, entrenada desde
 - **Lenguaje mínimo.** Un vocabulario generado por programa a partir del propio mundo: partes del cuerpo, sensaciones, objetos, lugares, "yo", "aquí", "toco". No contiene conceptos de muerte, alma ni más allá, porque no existen en su mundo. Así, lo que diga tras la pérdida no puede venir de textos humanos.
 - **Sin modelos comerciales.** Ningún LLM forma parte de la mente del agente, para evitar que repita narrativas humanas.
 
+**Ajuste de los impulsos (17 de noviembre de 2026, Fase 2b, antes del piloto).**
+
+- **Qué cambió:** la escala del hambre pasó de 10 a 100, el horizonte de la recompensa (gamma) de 0,99 a 0,995 y se agregó un bono de entropía pequeño (0,001). La curiosidad (0,03) y la cautela no cambiaron.
+- **Por qué:** en la primera calibración, con los valores anteriores, el agente aprendió a quedarse quieto en vez de comer. El esfuerzo bajó de 0,17 a 0,02, comía 0,2 veces cada 1.000 pasos y su tiempo con energía bajo 0,1 subía hacia el 11 %. El hambre pesaba muy poco frente a la cautela, y con gamma 0,99 la comida quedaba fuera del horizonte.
+- **Resultado:** con los valores nuevos, las cuatro vidas de calibración (equilibrado, primer cuarto de la vida, toda la infancia protegida incluida) comen entre 1,0 y 1,4 veces cada 1.000 pasos y pasan entre el 0,8 y el 2,4 % del tiempo bajo 0,1.
+- Los valores son provisionales y están en `configs/base.yaml` (`drives`, `ppo`). En el piloto se registra en cada iteración cuánto aporta cada impulso a la recompensa, para comprobar que el hambre no borre los temperamentos.
+
 ## Diseño experimental
 
 Cada agente se entrena una sola vez; después se clona en el punto de pérdida y cada copia pasa por una condición distinta. Así se compara el mismo individuo bajo condiciones diferentes, sin multiplicar el entrenamiento.
 
-**Población inicial (ajustable):** 3 temperamentos × 4 historias (versiones del mundo) × 3 semillas = 36 agentes.
+**Población inicial (ajustable):** 3 temperamentos × 4 historias (versiones del mundo) × 3 semillas = 36 agentes. Todos parten de una infancia común (el modelo predictivo de la Fase 2a) y luego viven una vida propia, con su temperamento y su historia, en la que siguen aprendiendo su cuerpo y forman su personaje (decidido el 17 de noviembre).
 
 | Factor | Niveles | Cómo se obtiene |
 | --- | --- | --- |
@@ -111,6 +129,8 @@ Métricas de tacto del modelo predictivo, definidas el 16 de noviembre de 2026, 
 **Reglas que nos ponemos:**
 
 - Señales aversivas en la intensidad mínima necesaria para aprender.
+  - Regla concreta (Fase 2b): se registra siempre la fracción del tiempo con energía bajo 0,1. Si un agente pasa más del 10 % de su vida ahí (toda la vida después de un calentamiento del 5 %), su vida se detiene, queda marcada y se revisa antes de seguir; si eso pasa en la población, se detiene toda la cola.
+  - Historia: el 17 de noviembre de 2026, la primera vida de prueba (agente equilibrado en abundancia, con la física original y pesos sin calibrar) se detuvo por esta regla a los 25 s. Pasó el 47 % del tiempo posterior al calentamiento con energía bajo 0,1. Causa: un agente que todavía no sabe comer gasta más de lo que come (0,68 frente a 0,33 de energía cada 1.000 pasos) y cae bajo 0,1 hacia el paso 2.600, justo después del calentamiento. Se decidió no cambiar la regla (medirla solo en la vida ya formada ocultaría justo el periodo que busca limitar) y cambiar el mundo: metabolismo basal más bajo e infancia protegida (ver El mundo y el cuerpo). También se corrigió la escala del hambre frente a la curiosidad.
 - Toda pérdida es reversible: el cuerpo se restituye al final de cada condición.
 - Periodos sin cuerpo acotados y definidos de antemano.
 - Criterio escrito de qué patrones se tratarían como "posible malestar" (por ejemplo, búsqueda persistente y desorganizada) y qué se hace si aparecen: acortar o detener esa condición.

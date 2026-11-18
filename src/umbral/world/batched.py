@@ -42,7 +42,7 @@ from umbral.world.histories import History, build_arena, spawn_food_point
 _STATE_ARRAYS = ("obstacle_pos", "obstacle_r", "obstacle_on", "neutral_pos", "neutral_r", "neutral_on",
                  "food_pos", "food_r", "food_valid", "food_active", "food_timer",
                  "pos", "heading", "q", "dq", "energy", "fatigue", "limbs", "raw",
-                 "steps", "world_steps", "food_eaten_total")
+                 "steps", "world_steps", "food_eaten_total", "metabolism")
 
 
 def _pad(arr: np.ndarray, n: int, fill: float) -> np.ndarray:
@@ -77,7 +77,10 @@ class BatchedUmbralEnv:
             hid: build_arena(self.wcfg, hid) for hid in sorted(self.wcfg.histories)}
         arenas = [a for a, _ in self._templates.values()]
         self.cap_obstacles = max(len(a.obstacle_r) for a in arenas)
-        self.cap_neutrals = max(len(a.neutral_r) for a in arenas)
+        # One extra neutral slot, always off in normal life: the probe used by the behaviour
+        # battery (an object that appears suddenly). It is padding like any other until placed.
+        self.cap_neutrals = max(len(a.neutral_r) for a in arenas) + 1
+        self.probe_slot = self.cap_neutrals - 1
         self.cap_food = max(len(a.food_r) for a in arenas)
         self.histories = [self._templates[h][1] for h in self.history_ids]
         self.respawn_steps = np.array([int(h.cfg.food_respawn_steps) for h in self.histories])
@@ -102,6 +105,9 @@ class BatchedUmbralEnv:
         self.world_steps = np.zeros(B, np.int64)
         self.food_eaten_total = np.zeros(B, np.int64)
         self.world_rngs: list[np.random.Generator | None] = [None] * B
+        # Factor on the energy cost of living (basal + effort), the same for every row. It is 1
+        # except in the protected childhood of an agent's life (set by umbral.mind.life).
+        self.metabolism = np.ones(())
         self.link = BatchedBodyLink(self.layout, [np.random.default_rng(0) for _ in range(B)])
         self._seeded = np.zeros(B, bool)
 
@@ -168,7 +174,8 @@ class BatchedUmbralEnv:
             self.food_active[touched] = False
             self.food_timer[touched] = np.broadcast_to(self.respawn_steps[:, None], touched.shape)[touched]
             eaten = touched.sum(axis=1)
-            balance = update_energy_b(p, self.energy, self.fatigue, mv["effort"], eaten.astype(float))
+            balance = update_energy_b(p, self.energy, self.fatigue, mv["effort"], eaten.astype(float),
+                                      float(self.metabolism))
             self.energy[L], self.fatigue[L] = balance["after"][L], balance["fatigue"][L]
             rows = np.flatnonzero(L)
             self.raw[rows] = self._raw_rows(rows)
@@ -234,13 +241,33 @@ class BatchedUmbralEnv:
         self.energy[r] = p.energy_initial
         self.fatigue[r] = 0.0
 
+    def place_probe(self, r: int, pos: np.ndarray, radius: float) -> None:
+        """Switch on the probe neutral object of environment ``r`` at ``pos`` (experimenter's action)."""
+        j = self.probe_slot
+        self.neutral_pos[r, j] = pos
+        self.neutral_r[r, j] = radius
+        self.neutral_on[r, j] = True
+        self.raw[r] = self._raw_rows(np.array([r]))[0]
+
+    def clear_probe(self, r: int) -> None:
+        """Switch the probe of environment ``r`` off again (back to padding)."""
+        j = self.probe_slot
+        self.neutral_pos[r, j] = FAR
+        self.neutral_r[r, j] = 0.0
+        self.neutral_on[r, j] = False
+        self.raw[r] = self._raw_rows(np.array([r]))[0]
+
     def row_arena(self, r: int) -> Arena:
         """Views of environment ``r``'s objects, trimmed to the real (non-padding) ones."""
         no = int(self.obstacle_on[r].sum())
-        nn = int(self.neutral_on[r].sum())
+        nn = int(self.neutral_on[r, :self.probe_slot].sum())
         nf = int(self.food_valid[r].sum())
-        return Arena(self.size, self.obstacle_pos[r, :no], self.obstacle_r[r, :no],
-                     self.neutral_pos[r, :nn], self.neutral_r[r, :nn],
+        if self.neutral_on[r, self.probe_slot]:  # the probe, when present, is a real object (copies)
+            keep = np.r_[np.arange(nn), self.probe_slot]
+            n_pos, n_r = self.neutral_pos[r, keep], self.neutral_r[r, keep]
+        else:
+            n_pos, n_r = self.neutral_pos[r, :nn], self.neutral_r[r, :nn]
+        return Arena(self.size, self.obstacle_pos[r, :no], self.obstacle_r[r, :no], n_pos, n_r,
                      self.food_pos[r, :nf], self.food_r[r, :nf], self.food_active[r, :nf], self.food_timer[r, :nf])
 
     def _tick_food(self, live: np.ndarray) -> None:
@@ -286,6 +313,9 @@ class BatchedUmbralEnv:
         if int(state["n_envs"]) != self.n or list(state["history_ids"]) != self.history_ids:
             raise ValueError("state belongs to a batch with other environments")
         for k in _STATE_ARRAYS:
+            if k == "metabolism" and k not in state["arrays"]:  # states saved before Phase 2b
+                self.metabolism[...] = 1.0
+                continue
             getattr(self, k)[...] = state["arrays"][k]
         self._last_obs = np.array(state["last_obs"], dtype=float)
         self._seeded[...] = state["seeded"]

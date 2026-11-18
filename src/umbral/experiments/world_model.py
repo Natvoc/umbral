@@ -20,7 +20,7 @@ import numpy as np
 from umbral.checkpoint import Checkpoint, load_checkpoint
 from umbral.config import Config
 from umbral.experiments.registry import register
-from umbral.mind.evaluation import TOUCH_EVENTS, evaluate, summarize
+from umbral.mind.evaluation import TOUCH_EVENTS, evaluate, ratio_cis, summarize
 from umbral.mind.model import CHANNELS, build_model
 from umbral.mind.policy import OUPolicy
 from umbral.mind.report import plot_checkpoint_eval, plot_learning_curves
@@ -67,12 +67,19 @@ def run_train_world_model(config: Config, recorder: Recorder, np_rng: np.random.
 @register("eval_world_model")
 def run_eval_world_model(config: Config, recorder: Recorder, np_rng: np.random.Generator,
                          resume: Checkpoint | None) -> None:
+    t_start = time.perf_counter()
     ec = config.eval
     if not ec.checkpoint:
         raise ValueError("eval.checkpoint must point to a train_world_model checkpoint")
     ckpt_path = Path(ec.checkpoint)
     ckpt = load_checkpoint(ckpt_path)
-    tcfg = Config(ckpt.config)  # world, body and mind exactly as trained
+    tcfg = Config(ckpt.config)  # world, body and mind exactly as trained ...
+    if str(ec.physics) == "current":  # ... or in today's world and body (e.g. after recalibrating energy)
+        d = ckpt.config if isinstance(ckpt.config, dict) else dict(ckpt.config)
+        now = config.to_dict()
+        tcfg = Config({**d, "world": now["world"], "body": now["body"]})
+    elif str(ec.physics) != "trained":
+        raise ValueError("eval.physics must be 'trained' or 'current'")
     hids = sorted(tcfg.world.histories)
     histories = [h for h in hids for _ in range(int(ec.envs_per_history))]
     n = len(histories)
@@ -80,6 +87,8 @@ def run_eval_world_model(config: Config, recorder: Recorder, np_rng: np.random.G
     sums = evaluate(models, tcfg, histories, [EVAL_SEED_BASE + i for i in range(n)],
                     [EVAL_SEED_BASE + POLICY_SEED_OFFSET + i for i in range(n)], int(ec.steps), int(ec.chunk))
     res = summarize(sums)
+    cis = ratio_cis(sums, n_boot=int(ec.n_boot), seed=int(ec.bootstrap_seed))
+    res["ratio_ci95"] = cis
     table, events = res["mse"], res["touch_events"]
     for c in CHANNELS:
         for p in table[c]:
@@ -89,18 +98,24 @@ def run_eval_world_model(config: Config, recorder: Recorder, np_rng: np.random.G
             if v is not None:
                 recorder.log_metric(0, f"{p}/touch_{e}", v)
 
+    def ci(lo_hi) -> str:
+        return f"[{lo_hi[0]:.3f}, {lo_hi[1]:.3f}]"
+
     recorder.log(f"{'channel':<9} {'efference':>12} {'no_efference':>13} {'persistence':>12} "
-                 f"{'eff/pers':>9} {'eff/noeff':>10}")
+                 f"{'eff/pers':>9} {'95% CI':>16} {'eff/noeff':>10} {'95% CI':>16}")
     for c in CHANNELS:
-        t = table[c]
+        t, k = table[c], cis["mse"][c]
         recorder.log(f"{c:<9} {t['efference']:>12.4e} {t['no_efference']:>13.4e} {t['persistence']:>12.4e} "
-                     f"{t['efference'] / t['persistence']:>9.3f} {t['efference'] / t['no_efference']:>10.3f}")
-    recorder.log(f"{'touch event':<16} {'n':>7} {'efference':>12} {'no_efference':>13} {'eff/noeff':>10}")
+                     f"{t['efference'] / t['persistence']:>9.3f} {ci(k['efference/persistence']):>16} "
+                     f"{t['efference'] / t['no_efference']:>10.3f} {ci(k['efference/no_efference']):>16}")
+    recorder.log(f"{'touch event':<16} {'n':>7} {'efference':>12} {'no_efference':>13} {'eff/noeff':>10} "
+                 f"{'95% CI':>16}")
     for e in TOUCH_EVENTS:
         v, cnt = events[e], res["touch_event_counts"][e]
         ratio = (v["efference"] / v["no_efference"]) if cnt and v["no_efference"] else float("nan")
         fmt = (lambda x: f"{x:.4e}" if x is not None else "n/a")
-        recorder.log(f"{e:<16} {cnt:>7} {fmt(v['efference']):>12} {fmt(v['no_efference']):>13} {ratio:>10.3f}")
+        recorder.log(f"{e:<16} {cnt:>7} {fmt(v['efference']):>12} {fmt(v['no_efference']):>13} {ratio:>10.3f} "
+                     f"{ci(cis['touch_events'][e]['efference/no_efference']):>16}")
 
     ratio = {c: table[c]["efference"] / table[c]["persistence"] for c in CHANNELS}
     ev = events["onset_self"]
@@ -111,8 +126,10 @@ def run_eval_world_model(config: Config, recorder: Recorder, np_rng: np.random.G
         "touch_onset_self_beats_no_efference": (ev["efference"] is not None and ev["no_efference"] is not None
                                                 and ev["efference"] < ev["no_efference"]),
     }
-    results = {"checkpoint": str(ckpt_path), "trained_updates": ckpt.step, "eval_steps": int(ec.steps),
-               "envs": n, "histories": hids, **res, "criteria": criteria}
+    results = {"checkpoint": str(ckpt_path), "physics": str(ec.physics),
+               "energy": tcfg.to_dict()["body"]["energy"], "trained_updates": ckpt.step, "eval_steps": int(ec.steps),
+               "envs": n, "histories": hids, "seconds": round(time.perf_counter() - t_start, 1), **res,
+               "criteria": criteria}
     train_metrics = ckpt_path.resolve().parents[1] / "metrics.jsonl"
     if train_metrics.is_file():
         results["learning_order"] = plot_learning_curves(train_metrics, recorder.run_dir / "learning_curves.png")

@@ -205,10 +205,14 @@ def move_body_b(p: BodyParams, size: float, pos: np.ndarray, heading: np.ndarray
 
 
 def update_energy_b(p: BodyParams, energy: np.ndarray, fatigue: np.ndarray, effort: np.ndarray,
-                    n_eaten: np.ndarray) -> dict[str, np.ndarray]:
-    """Energy/fatigue after one step, with the balance terms (all (B,))."""
-    basal = np.full(energy.shape, p.basal)
-    effort_cost = p.effort_cost * effort
+                    n_eaten: np.ndarray, metabolism: float = 1.0) -> dict[str, np.ndarray]:
+    """Energy/fatigue after one step, with the balance terms (all (B,)).
+
+    ``metabolism`` scales the whole energy cost of living (basal and effort); it is 1
+    except during the protected childhood of Phase 2b (``life.protected_infancy``).
+    """
+    basal = np.full(energy.shape, p.basal * metabolism)
+    effort_cost = p.effort_cost * metabolism * effort
     food_gain = p.food_value * n_eaten
     unclipped = energy - basal - effort_cost + food_gain
     return {

@@ -61,3 +61,32 @@ def test_partial_reset_matches_fresh_single_env():
         b_obs, *_ = batch.step(np.tile(a, (4, 1)))
         obs1, *_ = single.step(a)
         np.testing.assert_array_equal(b_obs["flat"][2], obs1["flat"])
+
+
+def test_probe_keeps_batch_equivalence_and_is_seen():
+    """The behaviour-battery probe (an extra neutral slot) obeys the same equivalence."""
+    cfg = make_config()
+    batch = BatchedUmbralEnv(cfg, 4, ["0", "1", "2", "3"])
+    batch.reset(seed=[5, 6, 7, 8])
+    singles = [UmbralEnv(cfg, history_id=h) for h in ["0", "1", "2", "3"]]
+    for env, s in zip(singles, [5, 6, 7, 8]):
+        env.reset(seed=s)
+    acts = [smooth_actions(30 + i, 120) for i in range(4)]
+    seen = False
+    for t in range(120):
+        if t == 40:
+            for i in (1, 3):
+                ahead = batch.pos[i] + 1.5 * np.array([np.cos(batch.heading[i]), np.sin(batch.heading[i])])
+                batch.place_probe(i, ahead, 0.3)
+                singles[i].batch.place_probe(0, ahead.copy(), 0.3)
+        if t == 90:
+            batch.clear_probe(1)
+            singles[1].batch.clear_probe(0)
+        b_obs, *_ = batch.step(np.stack([acts[i][t] for i in range(4)]))
+        for i, env in enumerate(singles):
+            obs, *_ = env.step(acts[i][t])
+            np.testing.assert_array_equal(b_obs["flat"][i], obs["flat"], err_msg=f"env {i} step {t}")
+        if t == 40:
+            seen = bool((b_obs["vision"][1, :, 4] == 1).any())  # the neutral column of some ray
+    assert seen
+    assert not batch.neutral_on[[0, 2], batch.probe_slot].any()

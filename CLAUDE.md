@@ -47,12 +47,23 @@ Umbral estudia agentes pequeños entrenados desde cero en un mundo 2D: cómo des
 - Las desviaciones estándar que normalizan los cambios se estiman una sola vez (calentamiento con semilla fija), se congelan y se guardan en el `state_dict`. Son las mismas para los dos modelos.
 - Semillas disjuntas: entrenamiento en `[0, 2**31)`, evaluación desde `2**31` y normalización desde `2**32`.
 
+## La mente que decide (Fase 2b)
+
+- **El modelo de sí mismo no se deforma por la recompensa.** El codificador, el GRU y la cabeza de predicción se entrenan solo con la pérdida de predicción. El actor y el crítico leen `h_t` con el gradiente detenido (`src/umbral/mind/agent.py`). Hay un test que lo comprueba; no se rompe.
+- La recompensa sale solo de los impulsos (`src/umbral/mind/drives.py`), calculados con la observación y la acción intentada. La curiosidad excluye la propiocepción y el auto-contacto. La cautela usa el costo nominal del esfuerzo.
+- Todos los agentes parten de la infancia común (`agent.infancy`). Los pesos de los impulsos y de los temperamentos son provisionales y están en `base.yaml`.
+- **Regla ética:** más del 10 % de la vida (después del 5 % inicial) con energía bajo 0,1 detiene la vida (`flagged`) y la cola de la población. No se relaja la regla: si se dispara, se avisa a la investigadora y el ajuste va en el mundo.
+- La infancia protegida (`life.protected_infancy`) y el metabolismo basal están documentados en el protocolo. Cualquier cambio en la física de la energía obliga a rehacer la línea base del modelo de la 2a (`eval.physics=current`).
+- Semillas: la batería de comportamiento usa `2**31 + 3_000_000 + i`.
+- La población vive en una carpeta fija (`population.dir`) con `population.json`; cada agente corre en su propio proceso.
+
 ## Fases
 
 - **Ninguna fase avanza sin cumplir su criterio de cierre**, verificado con comandos y tests, no por suposición.
 - Fase 0 (base del repositorio): cerrada cuando `umbral run --config configs/base.yaml experiment=noop` deja una carpeta completa en `runs/` y `pytest` pasa.
 - Fase 1 (mundo y cuerpo): cerrada cuando `umbral run --config configs/base.yaml experiment=random_agent` deja métricas, `signals.npz` y `run.gif`, y todos los tests pasan.
 - Fase 2a (modelo predictivo): equivalencia del lote probada y rendimiento registrado; reanudar y clonar con el mundo probado; una corrida completa de `train_world_model`; en la evaluación, el modelo supera claramente a la persistencia en todos los canales, y al modelo sin copia eferente al menos en propiocepción y tacto; todos los tests pasan.
+- Fase 2b (impulsos y temperamentos): intervalos de confianza de la 2a en el README; en el piloto (3 temperamentos × abundancia × 1 semilla), los temperamentos se distinguen en la batería de comportamiento (con tamaños de efecto e intervalos), los agentes comen y respetan la regla ética, y el error de predicción no empeora respecto de la 2a; `train_population` listo y probado, sin lanzar.
 - Las corridas largas (de horas) no se lanzan sin el visto bueno de la investigadora.
 - En esta laptop, `umbral.exe` está bloqueado por Smart App Control: se usa `python -m umbral ...`, que es equivalente.
 

@@ -132,3 +132,76 @@ def plot_checkpoint_eval(metrics_path: str | Path, out_path: str | Path) -> bool
     fig.savefig(out_path)
     plt.close(fig)
     return True
+
+
+TEMPERAMENT_COLORS = {"curioso": "#d4762b", "cauteloso": "#3b6fb6", "equilibrado": "#5a9a50"}
+MEASURE_ES = {"distance": "distancia recorrida", "area": "área cubierta", "energy_mean": "energía media",
+              "energy_below_0.3": "fracción energía < 0,3", "energy_below_0.1": "fracción energía < 0,1",
+              "food": "comida", "effort": "esfuerzo por paso", "neutral_contacts": "contactos con neutros",
+              "probe_delta": "cambio de distancia a la sonda", "probe_latency": "latencia ante la sonda",
+              "probe_approach": "fracción de acercamientos a la sonda"}
+LIFE_CURVES = ("energy", "energy_below_0.1", "food_per_1000_steps", "effort", "share_hunger",
+               "share_curiosity", "share_caution", "mse_proprio", "mse_vision", "ppo_approx_kl",
+               "ppo_clip_fraction", "action_std")
+
+
+def _metric_series(metrics_path: Path) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    series: dict[str, list] = defaultdict(list)
+    for line in metrics_path.read_text(encoding="utf-8").splitlines():
+        m = json.loads(line)
+        series[m["name"]].append((m["step"], m["value"]))
+    return {k: (np.array([s for s, _ in v]), np.array([x for _, x in v])) for k, v in series.items()}
+
+
+def plot_agents(report: dict, agent_dirs: list[Path], out_dir: Path) -> None:
+    """``behavior.png`` (means with 95 % CIs per measure) and ``life_curves.png`` (per iteration)."""
+    out_dir = Path(out_dir)
+    for key, fname, title in (("behavior", "behavior.png", "vida larga"),
+                              ("behavior_short", "behavior_short.png", "vida corta")):
+        comp = report.get(key)
+        if comp:
+            _plot_behavior(comp, out_dir / fname, title)
+    _plot_life_curves(agent_dirs, out_dir)
+
+
+def _plot_behavior(comp: dict, path: Path, title: str) -> None:
+    names = list(next(iter(comp["means"].values())))
+    fig, axes = plt.subplots(3, 4, figsize=(15, 9))
+    for ax, m in zip(axes.flat, comp["means"]):
+        for i, n in enumerate(names):
+            v = comp["means"][m][n]
+            if v is None:
+                continue
+            color = TEMPERAMENT_COLORS.get(n.split("-")[0], "#777777")
+            ax.bar(i, v["mean"], color=color, alpha=0.8)
+            ax.errorbar(i, v["mean"], yerr=[[v["mean"] - v["ci95"][0]], [v["ci95"][1] - v["mean"]]],
+                        color="black", capsize=3)
+        ax.set_xticks(range(len(names)), [n.split("-")[0] for n in names], fontsize=8)
+        ax.set_title(MEASURE_ES.get(m, m), fontsize=9)
+    for ax in list(axes.flat)[len(comp["means"]):]:
+        ax.axis("off")
+    fig.suptitle(f"Batería de comportamiento, {title} (media e IC 95 % sobre episodios)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+def _plot_life_curves(agent_dirs: list[Path], out_dir: Path) -> None:
+    fig, axes = plt.subplots(3, 4, figsize=(15, 9))
+    for d in agent_dirs:
+        mp = Path(d) / "metrics.jsonl"
+        if not mp.is_file():
+            continue
+        meta = json.loads((Path(d) / "meta.json").read_text(encoding="utf-8"))
+        temp = str(meta.get("temperament"))
+        series = _metric_series(mp)
+        for ax, k in zip(axes.flat, LIFE_CURVES):
+            if k in series:
+                x, y = series[k]
+                ax.plot(x, y, color=TEMPERAMENT_COLORS.get(temp, "#777777"), lw=1, label=temp)
+            ax.set_title(k, fontsize=9)
+    axes.flat[0].legend(fontsize=8)
+    fig.suptitle("Vida propia: curvas por iteración")
+    fig.tight_layout()
+    fig.savefig(out_dir / "life_curves.png", dpi=110)
+    plt.close(fig)

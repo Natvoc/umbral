@@ -133,3 +133,18 @@ def test_touch_event_errors_select_the_right_sensor_steps():
     assert np.isclose(res["offset_external"][0], (0.5**2 + 1) / 6)
     perfect = touch_event_sq_error(LAYOUT, cur, nxt, nxt)
     assert all(s == 0.0 for s, _ in perfect.values())
+
+
+def test_bootstrap_ci_is_stratified_and_brackets_the_estimate():
+    from umbral.mind.evaluation import bootstrap_ratio_ci
+
+    rng = np.random.default_rng(0)
+    hist = ["0"] * 10 + ["1"] * 10
+    den = np.stack([rng.uniform(1, 2, 20), np.full(20, 10.0)], 1)
+    num = den.copy()
+    num[:, 0] *= rng.uniform(0.5, 0.9, 20)
+    lo, hi = bootstrap_ratio_ci(num, den, hist, 2000, 1)
+    point = (num[:, 0].sum() / num[:, 1].sum()) / (den[:, 0].sum() / den[:, 1].sum())
+    assert lo < point < hi and 0.5 < lo and hi < 0.9
+    assert bootstrap_ratio_ci(den, den, hist, 200, 1) == (1.0, 1.0)
+    assert bootstrap_ratio_ci(num, den, hist, 500, 3) == bootstrap_ratio_ci(num, den, hist, 500, 3)
