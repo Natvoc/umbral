@@ -232,5 +232,5 @@ population:
   histories: ["0", "1", "2", "3"]
   seeds: [0, 1, 2]
   max_agents: null              # agents to run in this session (null = all pending)
-  parallel: 1                   # agents run at once (processes)
+  parallel: 2                   # agents run at once (processes), torch.num_threads split among them: 2 x 2 threads (~1.7x the throughput of 1 x 4)
   overrides: []                 # extra overrides passed to every agent run
