@@ -108,7 +108,7 @@ def test_hunger_gate_by_hand():
     np.testing.assert_allclose(hunger_gate(e, 0.8, 0.2), [0, 0, 0, 0.25, 0.5, 0.75, 1, 1, 1])
 
 
-def test_hungry_mind_feels_only_hunger_and_sated_mind_feels_everything():
+def test_hunger_silences_curiosity_but_never_the_caution_brake():
     cfg = make_config()
     assert float(cfg.drives.gate_low) == 0.2 and float(cfg.drives.set_point) == 0.8
     act = np.full((1, 1, 6), 0.5)
@@ -120,10 +120,11 @@ def test_hungry_mind_feels_only_hunger_and_sated_mind_feels_everything():
         cs, ks = float(cfg.drives.curiosity_scale), float(cfg.drives.caution_scale)
         caution = -ks * 0.0016 * 0.25
         np.testing.assert_allclose(c["gate"], gate)
-        # energy unchanged -> no hunger; curiosity is 1 on the first batch
-        np.testing.assert_allclose(total, gate * (cs * 1.0 + caution))
-    # hunger is never gated: at E = 0.15 a meal still counts in full
-    d = Drives(LAYOUT, cfg.drives, Temperament("x", curiosity=1.0, caution=1.0), effort_cost=0.0016)
+        # energy unchanged -> no hunger; curiosity is 1 on the first batch; caution in full at any energy
+        np.testing.assert_allclose(c["weighted"]["caution"], caution)
+        np.testing.assert_allclose(total, gate * cs * 1.0 + caution)
+    # hunger is never gated: at E = 0.15 a meal still counts in full (no effort, no world change here)
+    d = Drives(LAYOUT, cfg.drives, Temperament("x", curiosity=1.0, caution=1.0), effort_cost=0.0)
     cur, nxt = obs_with(1.0)[None, None].copy(), obs_with(1.0)[None, None].copy()
     cur[..., 105], nxt[..., 105] = 0.15, 0.45
     total, c = d(cur, nxt, cur.copy(), act)
@@ -144,13 +145,13 @@ def test_drives_combine_with_temperament_weights_and_normalize_curiosity():
     hs = float(cfg.drives.hunger_scale)
     np.testing.assert_allclose(c["hunger"], 0.05 * hs)
     np.testing.assert_allclose(c["caution"], -float(cfg.drives.caution_scale) * 0.0016 * 0.25)
-    # observed energy 0.5 -> gate (0.5 - 0.2) / (0.8 - 0.2) = 0.5 on curiosity and caution, not on hunger
+    # observed energy 0.5 -> gate (0.5 - 0.2) / (0.8 - 0.2) = 0.5 on curiosity only, not on hunger or caution
     np.testing.assert_allclose(c["gate"], 0.5)
-    np.testing.assert_allclose(total, 0.05 * hs + 0.5 * (2.0 * float(cfg.drives.curiosity_scale) + 3.0 * c["caution"]))
+    np.testing.assert_allclose(total, 0.05 * hs + 0.5 * 2.0 * float(cfg.drives.curiosity_scale) + 3.0 * c["caution"])
     w = c["weighted"]  # the contributions logged per iteration: they add up to the total
     np.testing.assert_allclose(w["hunger"], 0.05 * hs)
     np.testing.assert_allclose(w["curiosity"], 0.5 * 2.0 * float(cfg.drives.curiosity_scale))
-    np.testing.assert_allclose(w["caution"], 0.5 * 3.0 * c["caution"])
+    np.testing.assert_allclose(w["caution"], 3.0 * c["caution"])
     np.testing.assert_allclose(w["hunger"] + w["curiosity"] + w["caution"], total)
 
 
@@ -223,6 +224,9 @@ def test_life_report_writes_behavior_and_prediction_check(tmp_path, infancy):
     # phases: 6 iterations, protected childhood = round(0.2 * 6) = 1 iteration
     ph = meta["ethics"]["phases"]
     assert ph["infancy"]["steps"] == 4 * 16 and ph["adult"]["steps"] == 5 * 4 * 16
+    for v in ph.values():  # the bodies one by one, not only their mean
+        assert 0.0 <= v["energy_min"] - 0.01 <= v["energy_p10"] <= v["mean_energy"] + 0.1  # p10 at 0.01 resolution
+    assert {"energy_min", "energy_p10"} <= {json.loads(line)["name"] for line in read_metrics(d)}
     rows = [json.loads(line) for line in read_metrics(d)]
     shares = [r for r in rows if r["name"].startswith("share_")]
     assert len(shares) == 3 * 6

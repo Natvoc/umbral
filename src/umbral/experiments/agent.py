@@ -205,7 +205,8 @@ def run_agent_report(config: Config, recorder: Recorder, np_rng: np.random.Gener
     for name, info in agents.items():
         for ph, v in (info["ethics"].get("phases") or {}).items():
             recorder.log(f"{name} {ph}: energy {v['mean_energy']:.3f}  below 0.1 {v['fraction_below_0.1']:.4f}  "
-                         f"below 0.3 {v['fraction_below_0.3']:.4f}  food/1000 {v['food_per_1000_steps']:.2f}")
+                         f"below 0.3 {v['fraction_below_0.3']:.4f}  food/1000 {v['food_per_1000_steps']:.2f}  "
+                         f"min {v.get('energy_min')}  p10 {v.get('energy_p10')}")
         for ph, v in info["drive_shares"].items():
             if v:
                 recorder.log(f"{name} {ph} drive shares: " + "  ".join(

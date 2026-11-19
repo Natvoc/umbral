@@ -170,7 +170,7 @@ drives:
   curiosity_scale: 0.03         # curiosity = world-facing prediction error / its running mean
   curiosity_ema: 0.01           # rate of that running mean (per rollout)
   caution_scale: 100.0          # caution = -caution_scale * effort_cost * mean(a_t^2)
-  gate_low: 0.2                 # hunger gate g(E) = clip((E - gate_low) / (set_point - gate_low), 0, 1) multiplies curiosity and caution
+  gate_low: 0.2                 # hunger gate g(E) = clip((E - gate_low) / (set_point - gate_low), 0, 1) multiplies curiosity only (caution is the brake)
 
 agent:
   temperament: equilibrado      # key into temperaments

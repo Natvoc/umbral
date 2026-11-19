@@ -21,21 +21,25 @@ world directly.
   action ``a_t``, the one the mind knows. The executed action, which may differ by
   joint limits and strength, belongs to the body.
 
-**Hunger gates the other two** (shared architecture, the same for every temperament).
+**Hunger gates curiosity** (shared architecture, the same for every temperament).
 With the observed energy ``E_t``::
 
     g(E) = clip((E - E_low) / (E* - E_low), 0, 1)        (E_low = drives.gate_low)
 
-curiosity and caution are multiplied by ``g(E_t)``; hunger is not. With high energy
-each temperament is expressed in full; as energy falls, curiosity and caution fade
-for everyone and hunger rules, as an urgent need overrides exploration and the
-economy of effort in animals. Reason (18 Nov 2026 calibration): with curiosity
-always "on" at the same strength (it is normalised by its running mean) and
-hunger felt only when it was already late, the curious agent exhausted itself and
-the cautious one (high caution) became paralysed. Neither could know that, when
-hungry, it pays to explore less or to move even if it costs.
+curiosity is multiplied by ``g(E_t)``; hunger and caution are not. With high energy
+each temperament is expressed in full; as energy falls, curiosity fades for everyone
+and hunger rules, as an urgent need overrides exploration in animals. Reason (18 Nov
+2026 calibration): curiosity, normalised by its running mean, was always "on" at the
+same strength, and hunger was felt only when it was already late: the curious agent
+exhausted itself.
 
-The reward is ``hunger + g(E) * (w_curiosity * curiosity_scale * curiosity + w_caution * caution)``.
+Caution is *not* gated. The first version (19 Nov 2026) gated curiosity and caution
+alike, and failed: caution is the brake that protects energy (the life with caution
+at 0 had shown it), so gating it released the brake exactly when energy fell. The
+curious agent's effort rose from 0.20 to 0.28 as ``g`` fell to 0.5, and both seeds
+broke the ethics rule at a caution scale where, ungated, it had stayed healthy.
+
+The reward is ``hunger + g(E) * w_curiosity * curiosity_scale * curiosity + w_caution * caution``.
 The weights ``w_*`` define the temperament (the proportion of curiosity and caution). A common running scale (the std of the
 discounted return, ``RewardScaler``) divides the total. It is one factor for all
 drives, so it does not change their proportions.
@@ -143,7 +147,7 @@ class Drives:
         t = self.temperament
         gate = hunger_gate(cur[..., e], self.set_point, self.gate_low)  # energy the mind observes now
         weighted = {"hunger": hunger, "curiosity": gate * t.curiosity * self.curiosity_scale * curiosity,
-                    "caution": gate * t.caution * caution}
+                    "caution": t.caution * caution}  # caution is never gated: it is the brake
         total = weighted["hunger"] + weighted["curiosity"] + weighted["caution"]
         return total, {"hunger": hunger, "curiosity": curiosity, "caution": caution, "curiosity_raw": err,
                        "gate": gate, "weighted": weighted}

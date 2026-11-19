@@ -38,7 +38,9 @@ and std of its *weighted* contribution to the reward (``contrib_<drive>_mean``,
 ``_abs``, ``_std``) and its share of the total, ``share_<drive>`` = its mean absolute
 contribution over the sum of the three; and the hunger gate (``gate_mean``,
 ``gate_below_0.5``). The ethics counters are also kept per phase:
-protected childhood (iterations up to ``fraction * iterations``) and adulthood.
+protected childhood (iterations up to ``fraction * iterations``) and adulthood,
+with the lowest energy of any body and the 10th percentile over all bodies and steps (``energy_min``, ``energy_p10``; also logged every iteration): the
+mean of the 32 bodies can look healthy while a few of them are exhausted.
 
 Ethics: the experimenter (not the mind) watches the energy of every body. If, after
 a warm-up, more than ``ethics.max_low_fraction`` of the life is spent below
@@ -96,6 +98,14 @@ def ppo_loss(agent: Agent, h: torch.Tensor, u: torch.Tensor, logp_old: torch.Ten
                  "clip_fraction": float(((ratio - 1).abs() > clip).float().mean()),
                  "policy_loss": float(pg), "value_loss": float(vl), "entropy": float(ent)}
     return loss, stats
+
+
+def _hist_quantile(hist: list[int] | None, q: float) -> float | None:
+    """Quantile of the energies from their 0.01-wide histogram (lower edge of the bin)."""
+    if not hist or sum(hist) == 0:
+        return None
+    c = np.cumsum(hist)
+    return float(np.searchsorted(c, q * c[-1]) / 100)
 
 
 class Life:
@@ -303,6 +313,9 @@ class Life:
             self.rec.log_metric(it, f"contrib_{k}_abs", abs_means[k])
             self.rec.log_metric(it, f"contrib_{k}_std", float(w.std()))
             self.rec.log_metric(it, f"share_{k}", abs_means[k] / abs_total)
+        # The 32 bodies one by one, not only their mean: lowest energy and 10th percentile this iteration.
+        self.rec.log_metric(it, "energy_min", float(r["energy"].min()))
+        self.rec.log_metric(it, "energy_p10", float(np.percentile(r["energy"], 10)))
         self.rec.log_metric(it, "gate_mean", float(comps["gate"].mean()))
         self.rec.log_metric(it, "gate_below_0.5", float((comps["gate"] < 0.5).mean()))
 
@@ -313,6 +326,9 @@ class Life:
                        ("below_03", int((e < 0.3).sum())), ("food", int(r["food"].sum())),
                        ("energy_sum", float(e.sum()))):
             self.ethics[f"{key}_{phase}"] = self.ethics.get(f"{key}_{phase}", 0) + v
+        hist = np.bincount(np.clip((e * 100).astype(int), 0, 100).ravel(), minlength=101)
+        self.ethics[f"hist_{phase}"] = (np.asarray(self.ethics.get(f"hist_{phase}", np.zeros(101, int))) + hist).tolist()
+        self.ethics[f"min_{phase}"] = min(float(self.ethics.get(f"min_{phase}", 1.0)), float(e.min()))
         self.ethics["steps"] += e.size
         self.ethics["low"] += int((e < float(self.config.ethics.low_energy)).sum())
         self.ethics["below_03"] += int((e < 0.3).sum())
@@ -375,7 +391,9 @@ class Life:
                                 "fraction_below_0.1": e.get(f"low_{ph}", 0) / max(e.get(f"steps_{ph}", 0), 1),
                                 "fraction_below_0.3": e.get(f"below_03_{ph}", 0) / max(e.get(f"steps_{ph}", 0), 1),
                                 "mean_energy": e.get(f"energy_sum_{ph}", 0.0) / max(e.get(f"steps_{ph}", 0), 1),
-                                "food_per_1000_steps": e.get(f"food_{ph}", 0) / max(e.get(f"steps_{ph}", 0), 1) * 1000}
+                                "food_per_1000_steps": e.get(f"food_{ph}", 0) / max(e.get(f"steps_{ph}", 0), 1) * 1000,
+                                "energy_min": e.get(f"min_{ph}"),
+                                "energy_p10": _hist_quantile(e.get(f"hist_{ph}"), 0.10)}
                            for ph in ("infancy", "adult")},
                 "infancy_end_iteration": self.infancy_end,
                 "energy_curve": list(self.energy_curve),
