@@ -36,7 +36,8 @@ the mind's own dislike of effort, and the mind cannot read the body's metabolism
 Drive contributions: every iteration logs, per drive, the mean, mean absolute value
 and std of its *weighted* contribution to the reward (``contrib_<drive>_mean``,
 ``_abs``, ``_std``) and its share of the total, ``share_<drive>`` = its mean absolute
-contribution over the sum of the three. The ethics counters are also kept per phase:
+contribution over the sum of the three; and the hunger gate (``gate_mean``,
+``gate_below_0.5``). The ethics counters are also kept per phase:
 protected childhood (iterations up to ``fraction * iterations``) and adulthood.
 
 Ethics: the experimenter (not the mind) watches the energy of every body. If, after
@@ -302,6 +303,8 @@ class Life:
             self.rec.log_metric(it, f"contrib_{k}_abs", abs_means[k])
             self.rec.log_metric(it, f"contrib_{k}_std", float(w.std()))
             self.rec.log_metric(it, f"share_{k}", abs_means[k] / abs_total)
+        self.rec.log_metric(it, "gate_mean", float(comps["gate"].mean()))
+        self.rec.log_metric(it, "gate_below_0.5", float((comps["gate"] < 0.5).mean()))
 
         # Accumulate metrics and the ethics counters (experimenter side: true energy).
         e = r["energy"]

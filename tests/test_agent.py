@@ -13,7 +13,7 @@ from umbral.checkpoint import load_checkpoint
 from umbral.cli import run_experiment
 from umbral.config import load_config
 from umbral.mind.agent import Agent
-from umbral.mind.drives import (Drives, RewardScaler, Temperament, caution_reward, hunger_reward,
+from umbral.mind.drives import (Drives, RewardScaler, Temperament, caution_reward, hunger_gate, hunger_reward,
                                 world_prediction_error)
 from umbral.mind.life import ppo_loss
 from umbral.mind.model import build_model
@@ -103,6 +103,35 @@ def test_curiosity_counts_vision_and_external_touch_only():
     assert np.isclose(err, expected)
 
 
+def test_hunger_gate_by_hand():
+    e = np.array([0.0, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 1.0])
+    np.testing.assert_allclose(hunger_gate(e, 0.8, 0.2), [0, 0, 0, 0.25, 0.5, 0.75, 1, 1, 1])
+
+
+def test_hungry_mind_feels_only_hunger_and_sated_mind_feels_everything():
+    cfg = make_config()
+    assert float(cfg.drives.gate_low) == 0.2 and float(cfg.drives.set_point) == 0.8
+    act = np.full((1, 1, 6), 0.5)
+    for e_now, gate in ((0.15, 0.0), (0.8, 1.0), (0.95, 1.0)):
+        d = Drives(LAYOUT, cfg.drives, Temperament("x", curiosity=1.0, caution=1.0), effort_cost=0.0016)
+        cur, nxt = obs_with(1.0)[None, None].copy(), obs_with(0.5)[None, None].copy()
+        cur[..., 105], nxt[..., 105] = e_now, e_now
+        total, c = d(cur, nxt, cur.copy(), act)
+        cs, ks = float(cfg.drives.curiosity_scale), float(cfg.drives.caution_scale)
+        caution = -ks * 0.0016 * 0.25
+        np.testing.assert_allclose(c["gate"], gate)
+        # energy unchanged -> no hunger; curiosity is 1 on the first batch
+        np.testing.assert_allclose(total, gate * (cs * 1.0 + caution))
+    # hunger is never gated: at E = 0.15 a meal still counts in full
+    d = Drives(LAYOUT, cfg.drives, Temperament("x", curiosity=1.0, caution=1.0), effort_cost=0.0016)
+    cur, nxt = obs_with(1.0)[None, None].copy(), obs_with(1.0)[None, None].copy()
+    cur[..., 105], nxt[..., 105] = 0.15, 0.45
+    total, c = d(cur, nxt, cur.copy(), act)
+    hunger = float(cfg.drives.hunger_scale) * ((0.8 - 0.15) ** 2 - (0.8 - 0.45) ** 2)
+    np.testing.assert_allclose(c["weighted"]["hunger"], hunger)
+    np.testing.assert_allclose(total, hunger)
+
+
 def test_drives_combine_with_temperament_weights_and_normalize_curiosity():
     cfg = make_config()
     d = Drives(LAYOUT, cfg.drives, Temperament("x", curiosity=2.0, caution=3.0), effort_cost=0.0016)
@@ -115,10 +144,13 @@ def test_drives_combine_with_temperament_weights_and_normalize_curiosity():
     hs = float(cfg.drives.hunger_scale)
     np.testing.assert_allclose(c["hunger"], 0.05 * hs)
     np.testing.assert_allclose(c["caution"], -float(cfg.drives.caution_scale) * 0.0016 * 0.25)
-    np.testing.assert_allclose(total, 0.05 * hs + 2.0 * float(cfg.drives.curiosity_scale) + 3.0 * c["caution"])
+    # observed energy 0.5 -> gate (0.5 - 0.2) / (0.8 - 0.2) = 0.5 on curiosity and caution, not on hunger
+    np.testing.assert_allclose(c["gate"], 0.5)
+    np.testing.assert_allclose(total, 0.05 * hs + 0.5 * (2.0 * float(cfg.drives.curiosity_scale) + 3.0 * c["caution"]))
     w = c["weighted"]  # the contributions logged per iteration: they add up to the total
-    np.testing.assert_allclose(w["curiosity"], 2.0 * float(cfg.drives.curiosity_scale))
-    np.testing.assert_allclose(w["caution"], 3.0 * c["caution"])
+    np.testing.assert_allclose(w["hunger"], 0.05 * hs)
+    np.testing.assert_allclose(w["curiosity"], 0.5 * 2.0 * float(cfg.drives.curiosity_scale))
+    np.testing.assert_allclose(w["caution"], 0.5 * 3.0 * c["caution"])
     np.testing.assert_allclose(w["hunger"] + w["curiosity"] + w["caution"], total)
 
 
@@ -194,6 +226,8 @@ def test_life_report_writes_behavior_and_prediction_check(tmp_path, infancy):
     rows = [json.loads(line) for line in read_metrics(d)]
     shares = [r for r in rows if r["name"].startswith("share_")]
     assert len(shares) == 3 * 6
+    gates = [r for r in rows if r["name"] == "gate_mean"]
+    assert len(gates) == 6 and all(0.0 <= r["value"] <= 1.0 for r in gates)
     for step in range(1, 7):
         assert np.isclose(sum(r["value"] for r in shares if r["step"] == step), 1.0)
     rep = run_experiment(load_config(BASE_CONFIG, [f"run.output_dir={tmp_path.as_posix()}", "experiment=agent_report",

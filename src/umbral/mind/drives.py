@@ -21,8 +21,22 @@ world directly.
   action ``a_t``, the one the mind knows. The executed action, which may differ by
   joint limits and strength, belongs to the body.
 
-The reward is ``hunger + w_curiosity * curiosity_scale * curiosity + w_caution * caution``.
-The weights ``w_*`` define the temperament. A common running scale (the std of the
+**Hunger gates the other two** (shared architecture, the same for every temperament).
+With the observed energy ``E_t``::
+
+    g(E) = clip((E - E_low) / (E* - E_low), 0, 1)        (E_low = drives.gate_low)
+
+curiosity and caution are multiplied by ``g(E_t)``; hunger is not. With high energy
+each temperament is expressed in full; as energy falls, curiosity and caution fade
+for everyone and hunger rules, as an urgent need overrides exploration and the
+economy of effort in animals. Reason (18 Nov 2026 calibration): with curiosity
+always "on" at the same strength (it is normalised by its running mean) and
+hunger felt only when it was already late, the curious agent exhausted itself and
+the cautious one (high caution) became paralysed. Neither could know that, when
+hungry, it pays to explore less or to move even if it costs.
+
+The reward is ``hunger + g(E) * (w_curiosity * curiosity_scale * curiosity + w_caution * caution)``.
+The weights ``w_*`` define the temperament (the proportion of curiosity and caution). A common running scale (the std of the
 discounted return, ``RewardScaler``) divides the total. It is one factor for all
 drives, so it does not change their proportions.
 
@@ -60,6 +74,11 @@ def temperament_from_config(config, name: str) -> Temperament:
 
 def homeostatic_drive(energy: np.ndarray, set_point: float) -> np.ndarray:
     return (set_point - energy) ** 2
+
+
+def hunger_gate(energy: np.ndarray, set_point: float, low: float) -> np.ndarray:
+    """``g(E) = clip((E - low) / (set_point - low), 0, 1)``: 1 when sated, 0 when hungry."""
+    return np.clip((energy - low) / (set_point - low), 0.0, 1.0)
 
 
 def hunger_reward(e_now: np.ndarray, e_next: np.ndarray, set_point: float, scale: float) -> np.ndarray:
@@ -100,6 +119,7 @@ class Drives:
         self.hunger_scale = float(drives_cfg.hunger_scale)
         self.curiosity_scale = float(drives_cfg.curiosity_scale)
         self.caution_scale = float(drives_cfg.caution_scale)
+        self.gate_low = float(drives_cfg.gate_low)
         self.ema_rate = float(drives_cfg.curiosity_ema)
         self.effort_cost = float(effort_cost)
         self.error_mean: float | None = None  # running mean of the raw curiosity error
@@ -121,11 +141,12 @@ class Drives:
         self.error_mean = (1 - self.ema_rate) * self.error_mean + self.ema_rate * batch_mean
         caution = caution_reward(action, self.effort_cost, self.caution_scale)
         t = self.temperament
-        weighted = {"hunger": hunger, "curiosity": t.curiosity * self.curiosity_scale * curiosity,
-                    "caution": t.caution * caution}
+        gate = hunger_gate(cur[..., e], self.set_point, self.gate_low)  # energy the mind observes now
+        weighted = {"hunger": hunger, "curiosity": gate * t.curiosity * self.curiosity_scale * curiosity,
+                    "caution": gate * t.caution * caution}
         total = weighted["hunger"] + weighted["curiosity"] + weighted["caution"]
         return total, {"hunger": hunger, "curiosity": curiosity, "caution": caution, "curiosity_raw": err,
-                       "weighted": weighted}
+                       "gate": gate, "weighted": weighted}
 
     def get_state(self) -> dict[str, Any]:
         return {"error_mean": self.error_mean}
