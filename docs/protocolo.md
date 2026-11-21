@@ -189,6 +189,22 @@ Métricas de tacto del modelo predictivo, definidas el 16 de noviembre de 2026, 
   - Se elige la escala más pequeña que cumpla las tres. Si una vida dispara la regla, la serie de esa escala se detiene, la escala se descarta y se pasa a la siguiente. Si ninguna pasa, se detiene todo y se informa, sin probar otros ajustes.
   - Historia: el 21 de noviembre de 2026, la primera fase de comer de la infancia común (`runs/20261121-112141_fase2b_infancia_comer`, semilla 0, 32 cuerpos repartidos en las 4 historias) se detuvo por la regla en la iteración 300 de 3.600, con el 10,2 % del tiempo posterior al calentamiento bajo 0,1. Todavía estaba en la rampa (metabolismo 0,56) y nunca llegó a la primera evaluación del criterio (iteración 720). La energía media bajó de 0,94 a 0,54, la comida se quedó en 0,4–1,0 cada 1.000 pasos y el esfuerzo subió de 0,20 a 0,27, solo con hambre. En el checkpoint de la detención, la energía media por historia era 0,60 (abundancia), 0,13 (escasez), 0,51 (corredores) y 0,69 (oasis). Esta foto está confundida con la edad del episodio de cada cuerpo, porque el escalonamiento de los reinicios va en el mismo orden que los bloques de historia. La regla no se cambió y la decisión queda en manos de la investigadora.
   - Decisión de la investigadora: el problema es la economía de la energía. Con costo completo, un agente ingenuo gasta más de lo que encuentra, y la rampa subía por calendario, aprendiera o no. Hay una pista en la calibración del 18 de noviembre: con cautela, el equilibrado pasó esa ventana en las 4 historias porque gastaba poco (esfuerzo de 0,10 a 0,18); aquí, sin cautela, el esfuerzo se quedó en 0,25. Por eso, en la fase de comer el costo de vivir sube por competencia y no por calendario (ver La mente), y se registra cada historia en cada iteración, con los reinicios escalonados repartidos entre las historias. La regla ética no cambió. Las vidas propias conservan su rampa.
+  - Resultado (21 de noviembre de 2026, `runs/20261121-121257_fase2b_infancia_comer_competencia`, semilla 0): la fase llegó a las 3.600 iteraciones sin que el factor de costo alcanzara el 100 % (`timeout`, factor final 0,915). Por eso no hubo evaluación del criterio ni `common_start.pt`.
+    - **Fue sana:** el 3,8 % del tiempo posterior al calentamiento bajo 0,1 y el 6,4 % bajo 0,3, con una energía media de 0,73.
+    - **Aprendió a comer:** pasó de 0,3–0,6 a 2,2–3,6 veces cada 1.000 pasos según la historia.
+    - **Gastó cada vez más:** el esfuerzo subió de 0,28 a 0,37.
+    - **La condición de competencia se cumplió cada vez menos:** del 30 % de las iteraciones al principio al 6–14 % al final. Lo que más frenaba era la fracción bajo 0,1, que debía ser menor que el 1 % en la ventana.
+    - **Por historia, en las iteraciones 3.201–3.600:**
+
+      | Historia | Energía media | Tiempo bajo 0,1 | Comida cada 1.000 pasos |
+      |---|---|---|---|
+      | Abundancia | 0,84 | 0,1 % | 3,6 |
+      | Escasez | 0,62 | 10,8 % | 2,2 |
+      | Corredores | 0,74 | 3,3 % | 2,8 |
+      | Oasis | 0,74 | 7,1 % | 3,3 |
+
+    - **La exploración se redujo a menos de la mitad:** la desviación de la acción pasó de 0,607 a 0,276 (×0,46).
+    - La serie se detuvo y la decisión queda en manos de la investigadora.
 - Toda pérdida es reversible: el cuerpo se restituye al final de cada condición.
 - Periodos sin cuerpo acotados y definidos de antemano.
 - Criterio escrito de qué patrones se tratarían como "posible malestar" (por ejemplo, búsqueda persistente y desorganizada) y qué se hace si aparecen: acortar o detener esa condición.
