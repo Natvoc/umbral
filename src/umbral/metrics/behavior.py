@@ -12,6 +12,9 @@ the true world state):
   by the trunk centre;
 - ``energy_mean``, ``energy_below_0.3``, ``energy_below_0.1``: mean energy and the
   fractions of steps below 0.3 and 0.1;
+- ``energy_zero``: fraction of steps with energy exactly 0 (the body clips there).
+  An episode with ``energy_zero > 0`` reached empty; ``energy_zero_run`` is its
+  longest stretch at 0, in steps;
 - ``food``: items eaten;
 - ``effort``: mean ``mean(executed**2)`` per step;
 - ``neutral_contacts``: contacts with neutral objects, counted as onsets (steps where
@@ -48,7 +51,8 @@ from umbral.world.arena import NEUTRAL
 from umbral.world.batched import BatchedUmbralEnv
 
 BEHAVIOR_SEED_BASE = EVAL_SEED_BASE + 3_000_000
-MEASURES = ("distance", "area", "energy_mean", "energy_below_0.3", "energy_below_0.1", "food", "effort",
+MEASURES = ("distance", "area", "energy_mean", "energy_below_0.3", "energy_below_0.1", "energy_zero",
+            "energy_zero_run", "food", "effort",
             "neutral_contacts", "probe_delta", "probe_latency", "probe_approach")
 PROBE_ANGLES = (0.0, 0.3, -0.3, 0.6, -0.6)
 
@@ -93,7 +97,8 @@ def run_battery(agent: Agent, config: Config, history: str, episodes: int | None
         c = np.clip((env.pos / float(bc.grid)).astype(int), 0, G - 1)
         visited[np.arange(n), c[:, 0], c[:, 1]] = True
 
-    acc = {k: np.zeros(n) for k in ("distance", "energy", "below03", "below01", "food", "effort", "neutral")}
+    acc = {k: np.zeros(n) for k in ("distance", "energy", "below03", "below01", "zero", "zero_run", "zero_max",
+                                    "food", "effort", "neutral")}
     probes: list[list[tuple[float, int, int]]] = [[] for _ in range(n)]  # (delta, latency, sign)
     active: dict[int, dict[str, Any]] = {}
     was_neutral = np.zeros(n, bool)
@@ -118,6 +123,10 @@ def run_battery(agent: Agent, config: Config, history: str, episodes: int | None
         acc["energy"] += e
         acc["below03"] += e < 0.3
         acc["below01"] += e < 0.1
+        empty = e == 0.0
+        acc["zero"] += empty
+        acc["zero_run"] = np.where(empty, acc["zero_run"] + 1, 0.0)
+        acc["zero_max"] = np.maximum(acc["zero_max"], acc["zero_run"])
         acc["food"] += info["food_eaten"]
         acc["effort"] += (info["action_executed"] ** 2).mean(-1)
         touch = env.raw[:, tl].reshape(n, 10, 6)
@@ -141,6 +150,8 @@ def run_battery(agent: Agent, config: Config, history: str, episodes: int | None
         "energy_mean": (acc["energy"] / T).tolist(),
         "energy_below_0.3": (acc["below03"] / T).tolist(),
         "energy_below_0.1": (acc["below01"] / T).tolist(),
+        "energy_zero": (acc["zero"] / T).tolist(),
+        "energy_zero_run": acc["zero_max"].tolist(),
         "food": acc["food"].tolist(),
         "effort": (acc["effort"] / T).tolist(),
         "neutral_contacts": acc["neutral"].tolist(),

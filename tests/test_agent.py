@@ -215,6 +215,8 @@ def test_life_report_writes_behavior_and_prediction_check(tmp_path, infancy):
     for m in ("distance", "area", "food", "effort", "neutral_contacts", "probe_delta", "probe_latency"):
         assert len(beh[m]) == 2
     assert all(n >= 1 for n in beh["probes"])
+    for z, run, low in zip(beh["energy_zero"], beh["energy_zero_run"], beh["energy_below_0.1"]):
+        assert 0.0 <= z <= low and 0 <= run <= z * 60 + 1e-9
     pc = json.loads((d / "prediction_check.json").read_text(encoding="utf-8"))
     assert set(pc["channels"]) == {"proprio", "touch", "vision", "intero"}
     meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))

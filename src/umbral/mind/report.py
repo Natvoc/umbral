@@ -137,6 +137,7 @@ def plot_checkpoint_eval(metrics_path: str | Path, out_path: str | Path) -> bool
 TEMPERAMENT_COLORS = {"curioso": "#d4762b", "cauteloso": "#3b6fb6", "equilibrado": "#5a9a50"}
 MEASURE_ES = {"distance": "distancia recorrida", "area": "área cubierta", "energy_mean": "energía media",
               "energy_below_0.3": "fracción energía < 0,3", "energy_below_0.1": "fracción energía < 0,1",
+              "energy_zero": "fracción energía = 0", "energy_zero_run": "racha más larga en 0 (pasos)",
               "food": "comida", "effort": "esfuerzo por paso", "neutral_contacts": "contactos con neutros",
               "probe_delta": "cambio de distancia a la sonda", "probe_latency": "latencia ante la sonda",
               "probe_approach": "fracción de acercamientos a la sonda"}
@@ -166,7 +167,7 @@ def plot_agents(report: dict, agent_dirs: list[Path], out_dir: Path) -> None:
 
 def _plot_behavior(comp: dict, path: Path, title: str) -> None:
     names = list(next(iter(comp["means"].values())))
-    fig, axes = plt.subplots(3, 4, figsize=(15, 9))
+    fig, axes = plt.subplots(4, 4, figsize=(15, 12))
     for ax, m in zip(axes.flat, comp["means"]):
         for i, n in enumerate(names):
             v = comp["means"][m][n]
