@@ -212,8 +212,9 @@ def test_life_resume_reproduces_the_continuation(tmp_path, infancy):
 
 # --- the common childhood, part 2: learning to eat ------------------------------------------
 
-FEED = ["experiment=common_feeding", "feeding.eval_from=2", "feeding.eval_every=2", "feeding.eval_envs_per_history=1",
-        "feeding.eval_steps=20"]
+FEED = ["experiment=common_feeding", "feeding.eval_every=2", "feeding.eval_envs_per_history=1", "feeding.eval_steps=20",
+        "life.protected_infancy.fraction=0.1",  # ramp span 0.6 iterations: one competent step reaches full cost
+        "feeding.ramp_window=1", "feeding.ramp_max_below_01=1.01", "feeding.ramp_min_p10=0"]
 EASY = ["feeding.max_below_01=1.01", "feeding.max_below_03=1.01", "feeding.min_food_per_1000=0"]
 IMPOSSIBLE = ["feeding.min_food_per_1000=1e9"]
 
@@ -241,6 +242,10 @@ def test_feeding_phase_is_hunger_only_over_all_histories_and_stops_at_the_criter
     assert any(r["name"] == "contrib_hunger_abs" and r["value"] > 0 for r in rows)
     assert ck.extra["drives"]["error_mean"] is not None  # ... but the curiosity running mean is tracked
     assert {f"criterion_h{h}_food_per_1000_steps" for h in "0123"} <= {r["name"] for r in rows}
+    for h in "0123":  # per history, every iteration
+        for k in ("energy", "energy_below_0.1", "food_per_1000_steps"):
+            assert [r["step"] for r in rows if r["name"] == f"h{h}_{k}"] == [1, 2]
+    assert [r["value"] for r in rows if r["name"] == "cost_factor"] == [0.25, 1.0]
     s = json.loads((d / "feeding_summary.json").read_text(encoding="utf-8"))
     assert s["status"] == "completed" and len(s["evals"]) == 1 and s["evals"][0]["iteration"] == 2
     assert set(s["evals"][0]["histories"]) == {"0", "1", "2", "3"}
@@ -264,6 +269,62 @@ def test_feeding_eval_is_pure_and_seeds_are_disjoint(tmp_path, infancy, common_s
         life = Life(cfg, rec, np.random.default_rng(0), None, feeding=True)
         assert all(FEEDING_SEED_BASE <= life._new_seed() < FEEDING_SEED_BASE + 2**31 for _ in range(50))
         assert life.histories == ["0", "1", "2", "3"]
+
+
+def test_competence_condition_by_hand():
+    from umbral.mind.life import RAMP_BINS, competent
+
+    def it(energies):
+        e = np.array(energies)
+        hist = np.bincount(np.clip((e * RAMP_BINS).astype(int), 0, RAMP_BINS), minlength=RAMP_BINS + 1)
+        return {"steps": e.size, "low": int((e < 0.1).sum()), "hist": hist.tolist()}
+
+    good = it([0.5] * 95 + [0.35] * 5)
+    assert competent([good, good], 2, 0.01, 0.3)
+    assert not competent([good], 2, 0.01, 0.3)  # the window must be full
+    low = it([0.5] * 98 + [0.05] * 2)  # 2 % below 0.1 in this iteration: 1 % over the window of 2
+    assert not competent([good, low], 2, 0.01, 0.3)
+    assert competent([good, it([0.5] * 199 + [0.05])], 2, 0.01, 0.3)  # 1/300 < 1 %
+    thin = it([0.5] * 85 + [0.25] * 15)  # p10 = 0.25 < 0.3, nobody below 0.1
+    assert not competent([thin, thin], 2, 0.01, 0.3)
+    assert competent([thin, thin], 2, 0.01, 0.25)  # the p10 bound is inclusive
+
+
+def test_stagger_spreads_episode_ages_within_every_history():
+    from umbral.mind.life import stagger
+
+    E = 32
+    one = stagger(["0"] * 32, E)
+    np.testing.assert_array_equal(one, [E - (i * E) // 32 for i in range(32)])  # lives: unchanged
+    hs = [h for h in "0123" for _ in range(8)]
+    mixed = stagger(hs, E)
+    assert sorted(mixed.tolist()) == sorted(one.tolist())  # the same slots, dealt round-robin
+    for h in "0123":
+        ages = sorted(mixed[[x == h for x in hs]].tolist())
+        assert ages[0] <= 4 + 1 and ages[-1] >= E - 4 - 1  # every history spans the whole episode
+        assert np.mean(ages) == pytest.approx(np.mean(one), abs=2)
+
+
+def test_competence_ramp_rises_only_when_competent_never_falls_and_keeps_the_slope(tmp_path, infancy):
+    common = [*FEED, *IMPOSSIBLE, "life.protected_infancy.fraction=0.5", "feeding.ramp_window=2"]  # span 3
+    up = run_experiment(feeding_config(tmp_path, infancy, *common, "run.name=up"))
+    rows = [json.loads(line) for line in read_metrics(up)]
+    f = [r["value"] for r in rows if r["name"] == "cost_factor"]
+    ok = [r["value"] for r in rows if r["name"] == "ramp_competent"]
+    slope = 0.75 / 3
+    assert f == pytest.approx([0.25, 0.25, 0.25 + slope, 0.25 + 2 * slope, 1.0, 1.0])  # window full from iteration 2
+    assert ok == [0.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    for a, b, c in zip(f, f[1:], ok):
+        assert b >= a and b - a <= slope + 1e-12 and (b > a) == (c == 1.0 and a < 1.0)
+    s = json.loads((up / "feeding_summary.json").read_text(encoding="utf-8"))
+    assert s["full_cost_from_iteration"] == 5 and [e["iteration"] for e in s["evals"]] == [5]
+    # Never competent (p10 cannot reach 1.1): the factor stays at the start, no criterion evaluation at all.
+    flat = run_experiment(feeding_config(tmp_path, infancy, *common, "feeding.ramp_min_p10=1.1", "run.name=flat"))
+    rows = [json.loads(line) for line in read_metrics(flat)]
+    assert [r["value"] for r in rows if r["name"] == "cost_factor"] == [0.25] * 6
+    s = json.loads((flat / "feeding_summary.json").read_text(encoding="utf-8"))
+    assert s["status"] == "timeout" and s["evals"] == [] and s["full_cost_from_iteration"] is None
+    assert s["cost_factor_final"] == 0.25 and (flat / "feeding_curves.png").is_file()
 
 
 def test_feeding_phase_stops_at_the_time_cap_without_a_starting_point(tmp_path, infancy):

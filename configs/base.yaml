@@ -208,8 +208,10 @@ ppo:
   grad_clip: 0.5
 
 feeding:                        # experiment=common_feeding: common childhood part 2, learning to eat (hunger only, the 4 histories mixed)
-  eval_from: null               # first criterion evaluation (iteration; null = end of the protected-childhood ramp)
-  eval_every: 100               # then every this many iterations (multiple of life.log_every)
+  ramp_window: 20               # competence ramp: the cost factor (from protected_infancy.start_factor) steps up by the
+  ramp_max_below_01: 0.01       #   life ramp's slope only if, over the last ramp_window iterations and all bodies,
+  ramp_min_p10: 0.3             #   the fraction below 0.1 < this and the energy p10 >= this; otherwise it stays (never falls)
+  eval_every: 100               # criterion: first at full cost, then every this many iterations (multiple of life.log_every)
   eval_envs_per_history: 8
   eval_steps: 4096              # one whole episode, full cost, full initial energy, stochastic policy
   max_below_01: 0.02            # criterion, in every history: fraction of steps below 0.1 < this ...

@@ -9,10 +9,18 @@ Common childhood, in two parts, then the own life:
    critic, and hunger is its only drive (curiosity and caution weigh 0; the curiosity
    running mean is still tracked, so it reaches the lives calibrated). The bodies are
    spread over the 4 histories (``life.n_envs / 4`` each), so eating does not depend
-   on one world. The self-model keeps learning with the prediction loss only. The
-   same protected childhood ramp and ethics rule as a life apply. Environment seeds
-   come from their own range (``FEEDING_SEED_BASE + [0, 2**31)``). Every
-   ``feeding.eval_every`` iterations from the end of the ramp, ``feeding_eval`` runs
+   on one world; the episode stagger is dealt round-robin over the histories
+   (``stagger``), so a body's episode age is not tied to its history, and energy,
+   food and the fraction below 0.1 are logged per history every iteration. The
+   self-model keeps learning with the prediction loss only. The ethics rule is the
+   same as in a life. The cost of living rises **by competence, not by calendar**:
+   it starts at ``start_factor`` and steps up by the life ramp's slope only after an
+   iteration in which, over the last ``feeding.ramp_window`` iterations and all bodies,
+   the fraction below 0.1 is < ``ramp_max_below_01`` and the energy p10 >=
+   ``ramp_min_p10`` (``competent``); otherwise it stays, and it never falls. It is
+   logged as ``cost_factor``. Environment seeds come from their own range
+   (``FEEDING_SEED_BASE + [0, 2**31)``). From the first iteration at full cost, every
+   ``feeding.eval_every`` iterations, ``feeding_eval`` runs
    the termination criterion: full cost, stochastic policy, fixed evaluation seeds
    (``FEEDING_EVAL_SEED_BASE + i``), every history on its own. When all histories meet
    it, ``checkpoints/common_start.pt`` is saved: the single starting point of every
@@ -91,6 +99,46 @@ COMPONENTS = ("hunger", "curiosity", "caution")
 HUNGER_ONLY = Temperament("hambre", 0.0, 0.0)  # the drive of the common feeding phase (not a temperament)
 FEEDING_SEED_BASE = 3 * 2**31  # training seeds of the feeding phase: [3*2**31, 4*2**31), disjoint from all others
 FEEDING_EVAL_SEED_BASE = EVAL_SEED_BASE + 4_000_000  # its termination criterion (battery: +3_000_000)
+
+
+RAMP_BINS = 1000  # energy histogram resolution of the competence window (0.001)
+
+
+def competent(window: list[dict[str, Any]], size: int, max_low: float, min_p10: float) -> bool:
+    """The competence ramp's condition over the last ``size`` iterations (all bodies, all steps).
+
+    True only with a full window, a fraction of steps below 0.1 < ``max_low`` and the
+    10th percentile of the energy >= ``min_p10`` (lower edge of its 0.001-wide bin, so
+    never optimistic).
+    """
+    if len(window) < size:
+        return False
+    w = window[-size:]
+    steps = sum(x["steps"] for x in w)
+    low = sum(x["low"] for x in w) / steps
+    hist = np.sum([x["hist"] for x in w], axis=0)
+    p10 = float(np.searchsorted(np.cumsum(hist), 0.10 * steps) / RAMP_BINS)
+    return low < max_low and p10 >= min_p10
+
+
+def stagger(histories: list[str], E: int) -> np.ndarray:
+    """Initial rollouts left per body, staggered so every history has ages spread over the episode.
+
+    With one history it is the original order ``E - (i * E) // N``. With several, the
+    stagger slots are dealt round-robin over the histories, so the episode age of a
+    body is not tied to its history block.
+    """
+    N = len(histories)
+    names = list(dict.fromkeys(histories))
+    if len(names) == 1:
+        order = list(range(N))
+    else:
+        rank = {h: 0 for h in names}
+        order = []
+        for h in histories:
+            order.append(rank[h] * len(names) + names.index(h))
+            rank[h] += 1
+    return np.array([E - (k * E) // N for k in order])
 
 
 def feeding_histories(config: Config, n: int) -> list[str]:
@@ -214,11 +262,13 @@ class Life:
             self.history = "all"
             self.histories = feeding_histories(config, self.N)
             fc = config.feeding
-            self.eval_from = self.infancy_end if fc.eval_from is None else int(fc.eval_from)
             self.eval_every = int(fc.eval_every)
-            if self.eval_every % self.log_every or self.eval_from % self.log_every:
-                raise ValueError("feeding.eval_every and eval_from must be multiples of life.log_every")
+            if self.eval_every % self.log_every:
+                raise ValueError("feeding.eval_every must be a multiple of life.log_every")
             self.max_seconds = float(fc.max_hours) * 3600
+            # Competence ramp: the cost factor rises one step (the life ramp's slope) only when competent.
+            self.ramp_steps = max(1, self.infancy_end)
+            self.ramp_window = int(fc.ramp_window)
         else:
             self.temperament = temperament_from_config(config, str(config.agent.temperament))
             self.history = str(config.agent.history)
@@ -258,12 +308,13 @@ class Life:
             self.h = world.initial_state(self.N)
             self.prev_action = np.zeros((self.N, 6))
             E = self.episode_rollouts
-            self.life_left = np.array([E - (i * E) // self.N for i in range(self.N)])
+            self.life_left = stagger(self.histories, E)
             self.start, self.elapsed_before = 0, 0.0
             self.ethics = {"steps": 0, "low": 0, "below_03": 0, "food": 0, "energy_sum": 0.0}
             self.energy_curve: list[float] = []
             self.feeding_evals: list[dict[str, Any]] = []
             self.log_std_init = self.agent.policy.log_std.detach().tolist()
+            self.ramp = {"n_up": 0, "window": [], "next_eval": None, "full_at": None}
         else:
             resume.load_into({"agent": self.agent}, self.opts)
             self.noise.set_state(resume.policy)
@@ -278,6 +329,7 @@ class Life:
             self.energy_curve = list(ex["energy_curve"])
             self.feeding_evals = list(ex.get("feeding_evals", []))
             self.log_std_init = list(ex.get("log_std_init", []))
+            self.ramp = dict(ex.get("ramp") or {"n_up": 0, "window": [], "next_eval": None, "full_at": None})
             self.start, self.elapsed_before = int(resume.step), float(ex["elapsed_seconds"])
             self.np_rng = resume.activate()
         self.times = {"world": 0.0, "mind_acting": 0.0, "predictor": 0.0, "ppo": 0.0, "io": 0.0}
@@ -349,16 +401,41 @@ class Life:
         return r
 
     def metabolism(self, it: int) -> float:
-        """Protected childhood: factor on the cost of living, rising linearly to 1."""
+        """Protected childhood: factor on the cost of living, rising to 1.
+
+        In a life it rises linearly with the iterations (calendar). In the feeding phase it
+        rises by competence: ``n_up`` steps of the same maximal slope, ``(1 - start) / span``
+        per iteration, one step only after an iteration that met the competence condition.
+        """
         pi = self.config.life.protected_infancy
         span = float(pi.fraction) * self.iterations
         if span <= 0:
             return 1.0
         start = float(pi.start_factor)
-        return start + (1.0 - start) * min(1.0, (it - 1) / span)
+        progress = self.ramp["n_up"] if self.feeding else it - 1
+        return start + (1.0 - start) * min(1.0, progress / span)
+
+    def _update_ramp(self, it: int, e: np.ndarray) -> None:
+        """Feeding phase: add this iteration to the competence window; step the cost factor up if competent."""
+        fc = self.config.feeding
+        hist = np.bincount(np.clip((e * RAMP_BINS).astype(int), 0, RAMP_BINS).ravel(), minlength=RAMP_BINS + 1)
+        w = self.ramp["window"]
+        w.append({"steps": int(e.size), "low": int((e < float(self.config.ethics.low_energy)).sum()),
+                  "hist": hist.tolist()})
+        del w[:-self.ramp_window]
+        span = float(self.config.life.protected_infancy.fraction) * self.iterations
+        ok = competent(w, self.ramp_window, float(fc.ramp_max_below_01), float(fc.ramp_min_p10))
+        if ok and self.ramp["n_up"] < span:
+            self.ramp["n_up"] += 1
+        self.rec.log_metric(it, "ramp_competent", float(ok))
+        if self.ramp["full_at"] is None and self.metabolism(it + 1) >= 1.0:
+            self.ramp["full_at"] = it + 1  # first iteration lived at full cost
+            # first criterion evaluation: the first logged iteration at full cost, then every eval_every
+            self.ramp["next_eval"] = -(-(it + 1) // self.log_every) * self.log_every
 
     def step(self, it: int) -> None:
         self.env.metabolism[...] = self.metabolism(it)
+        self.rec.log_metric(it, "cost_factor", float(self.env.metabolism))  # = metabolism; every iteration
         r = self._collect()
         lc, pc = self.config.life, self.config.ppo
         world, layout = self.agent.world, self.env.layout
@@ -432,7 +509,19 @@ class Life:
 
         # Accumulate metrics and the ethics counters (experimenter side: true energy).
         e = r["energy"]
-        phase = "infancy" if it <= self.infancy_end else "adult"
+        if self.feeding:
+            phase = "infancy" if float(self.env.metabolism) < 1.0 else "adult"
+            # Per history, every iteration (bodies of each history have spread episode ages: ``stagger``).
+            for name in dict.fromkeys(self.histories):
+                rows = np.array([x == name for x in self.histories])
+                eh = e[rows]
+                self.rec.log_metric(it, f"h{name}_energy", float(eh.mean()))
+                self.rec.log_metric(it, f"h{name}_energy_below_0.1",
+                                    float((eh < float(self.config.ethics.low_energy)).mean()))
+                self.rec.log_metric(it, f"h{name}_food_per_1000_steps", float(r["food"][rows].sum() / eh.size * 1000))
+            self._update_ramp(it, e)
+        else:
+            phase = "infancy" if it <= self.infancy_end else "adult"
         for key, v in (("steps", e.size), ("low", int((e < float(self.config.ethics.low_energy)).sum())),
                        ("below_03", int((e < 0.3).sum())), ("food", int(r["food"].sum())),
                        ("energy_sum", float(e.sum()))):
@@ -486,7 +575,8 @@ class Life:
                    "scaler": {**self.scaler.get_state(), "ret": self.scaler.ret.tolist()},
                    "ethics": dict(self.ethics), "energy_curve": list(self.energy_curve),
                    "elapsed_seconds": elapsed, "temperament": self.temperament.name, "history": self.history,
-                   "feeding_evals": list(self.feeding_evals), "log_std_init": list(self.log_std_init)},
+                   "feeding_evals": list(self.feeding_evals), "log_std_init": list(self.log_std_init),
+                   "ramp": dict(self.ramp)},
             env=self.env, policy=self.noise,
             mind_state={"h": self.h, "prev_action": torch.as_tensor(self.prev_action)})
         return save_checkpoint(self.rec.run_dir / "checkpoints" / f"{name}.pt", ckpt)
@@ -532,7 +622,8 @@ class Life:
                     self.checkpoint(it, f"iter_{it:07d}", elapsed)
                     status = "flagged"
                     break
-                if self.feeding and it >= self.eval_from and (it - self.eval_from) % self.eval_every == 0:
+                if self.feeding and self.ramp["next_eval"] is not None and it >= self.ramp["next_eval"]:
+                    self.ramp["next_eval"] = it + self.eval_every
                     ev = feeding_eval(self.agent, self.config)
                     ev["iteration"] = it
                     self.feeding_evals.append(ev)
@@ -576,6 +667,8 @@ class Life:
         }
         if self.feeding:
             summary["feeding"] = {"evals": list(self.feeding_evals), "log_std_init": list(self.log_std_init),
+                                  "cost_factor_final": float(self.metabolism(self.start + done_here + 1)),
+                                  "full_cost_from_iteration": self.ramp["full_at"],
                                   "log_std_final": self.agent.policy.log_std.detach().tolist()}
         self.rec.update_meta(**summary)
         return summary

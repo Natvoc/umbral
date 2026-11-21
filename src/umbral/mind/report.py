@@ -236,3 +236,39 @@ def plot_feeding(evals: list[dict], config, path: Path) -> None:
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     plt.close(fig)
+
+
+def plot_feeding_curves(run_dirs: list[Path], path: Path) -> None:
+    """Feeding phase over iterations: the cost factor and, per history, energy, fraction below 0.1, food."""
+    series: dict[str, dict[int, float]] = defaultdict(dict)
+    for d in run_dirs:
+        mp = Path(d) / "metrics.jsonl"
+        if not mp.is_file():
+            continue
+        for line in mp.read_text(encoding="utf-8").splitlines():
+            r = json.loads(line)
+            if r["name"] == "cost_factor" or (r["name"].startswith("h") and r["name"][1:2].isdigit()):
+                series[r["name"]][r["step"]] = r["value"]
+    names = sorted({k.split("_", 1)[0][1:] for k in series if k != "cost_factor"}, key=int)
+    panels = (("cost_factor", "factor de costo de vivir"), ("energy", "energía media"),
+              ("energy_below_0.1", "fracción energía < 0,1"), ("food_per_1000_steps", "comida cada 1.000 pasos"))
+    fig, axes = plt.subplots(1, 4, figsize=(16, 3.8), dpi=110)
+    for ax, (key, title) in zip(axes, panels):
+        keys = ["cost_factor"] if key == "cost_factor" else [f"h{h}_{key}" for h in names]
+        for i, k in enumerate(keys):
+            s = series.get(k)
+            if not s:
+                continue
+            x = np.array(sorted(s))
+            y = np.array([s[j] for j in x])
+            if key != "cost_factor" and len(y) >= 10:  # 10-iteration running mean
+                y = np.convolve(y, np.ones(10) / 10, mode="same")
+            ax.plot(x, y, lw=1.2, color="black" if key == "cost_factor" else HISTORY_COLORS[i % len(HISTORY_COLORS)],
+                    label=None if key == "cost_factor" else f"h{names[i]}")
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("iteración")
+    axes[1].legend(fontsize=8)
+    fig.suptitle("Infancia común, aprender a comer: rampa por competencia y cada historia (media móvil de 10)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)

@@ -175,7 +175,7 @@ def run_common_feeding(config: Config, recorder: Recorder, np_rng: np.random.Gen
     ``log_std`` at its initialization and at the end (how much exploration the phase
     took away), plus the ethics summary.
     """
-    from umbral.mind.report import plot_feeding
+    from umbral.mind.report import plot_feeding, plot_feeding_curves
 
     life = Life(config, recorder, np_rng, resume, feeding=True)
     summary = life.run()
@@ -184,7 +184,8 @@ def run_common_feeding(config: Config, recorder: Recorder, np_rng: np.random.Gen
     init, final = np.array(f["log_std_init"]), np.array(f["log_std_final"])
     out = {"status": summary["life_status"], "common_start": str(d / "checkpoints" / "common_start.pt")
            if summary["life_status"] == "completed" else None,
-           "evals": f["evals"],
+           "evals": f["evals"], "cost_factor_final": f["cost_factor_final"],
+           "full_cost_from_iteration": f["full_cost_from_iteration"],
            "log_std": {"init": init.tolist(), "final": final.tolist(), "init_mean": float(init.mean()),
                        "final_mean": float(final.mean()), "std_init_mean": float(np.exp(init).mean()),
                        "std_final_mean": float(np.exp(final).mean()),
@@ -197,8 +198,11 @@ def run_common_feeding(config: Config, recorder: Recorder, np_rng: np.random.Gen
                      f"of the phase below {config.ethics.low_energy} after warm-up")
     recorder.log(f"feeding {summary['life_status']}: action std {out['log_std']['std_init_mean']:.3f} -> "
                  f"{out['log_std']['std_final_mean']:.3f} (x{out['log_std']['std_ratio_final_over_init']:.2f})")
+    recorder.log(f"cost factor at the end {out['cost_factor_final']:.3f}; full cost from iteration "
+                 f"{out['full_cost_from_iteration']}")
     if f["evals"]:
         plot_feeding(f["evals"], config, d / "feeding_criterion.png")
+    plot_feeding_curves(run_chain(d), d / "feeding_curves.png")
 
 
 def energy_zero_summary(beh: dict[str, list[float]] | None) -> dict[str, Any] | None:
