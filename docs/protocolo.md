@@ -212,6 +212,14 @@ Métricas de tacto del modelo predictivo, definidas el 16 de noviembre de 2026, 
     - **La exploración se redujo a menos de la mitad:** la desviación de la acción pasó de 0,607 a 0,276 (×0,46).
     - La serie se detuvo y la decisión queda en manos de la investigadora.
   - Decisión de la investigadora: la corrida cumplió parte de su objetivo (aprender a comer sin pasar hambre), pero el punto de partida que dejaría es intenso y rígido. Queda marcada `discarded_as_start`. La infancia común se vive ahora con el temperamento equilibrado (escala de cautela 50, provisional) y parte de nuevo desde la 2a. Se mantienen la rampa por competencia, el criterio, la regla, el registro por historia, las semillas y la mezcla de historias. El tope pasa a 3.600 iteraciones o 3 horas.
+  - Resultado (21 de noviembre de 2026, `runs/20261121-141752_fase2b_infancia_equilibrado`, semilla 0, 70 minutos): la fase terminó (`completed`) y dejó `common_start.pt`, que ahora es `agent.start`.
+    - **Rampa:** el factor de costo llegó a 0,5 / 0,75 / 0,9 / 1,0 en las iteraciones 436 / 1.462 / 2.190 / 2.417. Con solo hambre había llegado a 0,5 / 0,75 / 0,9 en las iteraciones 872 / 2.009 / 3.377 y nunca a 1,0.
+    - **Criterio:** pasó en la 9.ª evaluación (iteración 3.220), con las 4 historias dentro. Las 8 anteriores fallaron, casi siempre en corredores u oasis, que oscilaron mucho (hasta un 15 % del tiempo bajo 0,1 en oasis y un 13 % en corredores en algunas evaluaciones). Fue una pasada tras oscilar, no una mejora sostenida. El criterio no se cambió.
+    - **Fue sana:** el 2,7 % del tiempo posterior al calentamiento bajo 0,1 (2,0 % durante la rampa y 4,2 % con costo completo), con una energía media de 0,73. La regla no se disparó.
+    - **Gastó menos y comió menos que con solo hambre:** el esfuerzo pasó de 0,22 a un máximo de 0,27 y bajó a 0,14 (con solo hambre subió de 0,23 a 0,38). Comía 1,4 veces cada 1.000 pasos al final (con solo hambre, 2,9).
+    - **Peso de cada impulso en la recompensa:** al principio dominaba la curiosidad (hambre 15 %, curiosidad 56 %, cautela 29 %). Al final: hambre 43 %, curiosidad 38 %, cautela 19 %.
+    - **La exploración se redujo más que con solo hambre:** la desviación de la acción pasó de 0,607 a 0,160 (×0,26, frente a ×0,46). El punto de partida es más determinista, y eso puede limitar cuánto se diferencian los temperamentos.
+    - **Batería del punto de partida** (abundancia, 8 episodios, `runs/20261121-152720_calib5_bat_common_start_h0`): energía media de 0,80, ningún tiempo bajo 0,3 ni en cero, de 5 a 8 comidas por episodio, esfuerzo de unos 0,13 y acercamiento en todas las sondas con dato.
 - Toda pérdida es reversible: el cuerpo se restituye al final de cada condición.
 - Periodos sin cuerpo acotados y definidos de antemano.
 - Criterio escrito de qué patrones se tratarían como "posible malestar" (por ejemplo, búsqueda persistente y desorganizada) y qué se hace si aparecen: acortar o detener esa condición.
