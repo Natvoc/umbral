@@ -20,7 +20,7 @@ from umbral.mind.life import ppo_loss
 from umbral.mind.model import build_model
 
 LAYOUT = ObsLayout(7)
-TINY_LIFE = ["mind.encoder=16", "mind.hidden=16", "mind.head_hidden=16", "agent.width=16",
+TINY_LIFE = ["agent.start=null", "mind.encoder=16", "mind.hidden=16", "mind.head_hidden=16", "agent.width=16",
              "life.n_envs=4", "life.rollout=16", "life.seq_len=8", "life.episode_steps=32", "life.iterations=6",
              "life.log_every=1", "life.checkpoint_every=2", "ppo.minibatches=2", "ppo.epochs=2",
              "behavior.episodes=2", "behavior.steps=60", "behavior.probe_offset=10", "behavior.probe_every=25",
@@ -379,7 +379,10 @@ def test_lives_start_exactly_from_the_common_starting_point(tmp_path, infancy, c
         sd = life.agent.state_dict()
         assert set(sd) == set(ck.models["agent"])  # mind (with its frozen normalization), actor and critic
         for k, v in ck.models["agent"].items():
-            assert torch.equal(sd[k], v), k
+            if k == "policy.log_std":  # life.reset_action_std: back to its initial value
+                assert torch.equal(sd[k], torch.full_like(v, float(cfg.agent.init_log_std))), k
+            else:
+                assert torch.equal(sd[k], v), k
         for name in ("world", "policy"):
             got, want = life.opts[name].state_dict()["state"], ck.optimizers[name]["state"]
             assert set(got) == set(want)
@@ -393,6 +396,50 @@ def test_lives_start_exactly_from_the_common_starting_point(tmp_path, infancy, c
         for k in want:
             np.testing.assert_array_equal(np.asarray(got[k]), np.asarray(want[k]), err_msg=k)
         np.testing.assert_array_equal(life.scaler.ret, fresh.ret)
+
+
+def test_the_action_std_is_reset_at_the_start_of_every_life_and_nothing_else(tmp_path, infancy, common_start):
+    from umbral.checkpoint import save_checkpoint
+    from umbral.mind.life import Life
+    from umbral.recorder import Recorder
+
+    ck = load_checkpoint(common_start / "checkpoints" / "common_start.pt")
+    ck.models["agent"]["policy.log_std"] = torch.full_like(ck.models["agent"]["policy.log_std"], -2.0)
+    path = save_checkpoint(tmp_path / "narrow_start.pt", ck)  # a childhood that narrowed the action std
+    ck = load_checkpoint(path)
+    lives = {}
+    for reset in (True, False):
+        cfg = life_config(tmp_path, infancy, f"agent.start={path.as_posix()}", f"life.reset_action_std={reset}",
+                          f"run.name=reset{reset}")
+        with Recorder(cfg) as rec:
+            lives[reset] = Life(cfg, rec, np.random.default_rng(0), None)
+            meta = json.loads((rec.run_dir / "meta.json").read_text(encoding="utf-8"))
+        if reset:
+            assert meta["action_log_std_from_start"] == [-2.0] * 6 and meta["action_log_std_reset_to"] == -0.5
+        else:
+            assert "action_log_std_reset_to" not in meta
+    on, off = lives[True].agent.state_dict(), lives[False].agent.state_dict()
+    assert torch.equal(on["policy.log_std"], torch.full((6,), -0.5))
+    assert torch.equal(off["policy.log_std"], torch.full((6,), -2.0))
+    for k, v in ck.models["agent"].items():  # the actor's mean, the critic and the mind stay as they were
+        if k != "policy.log_std":
+            assert torch.equal(on[k], v) and torch.equal(off[k], v), k
+    for name in ("world", "policy"):
+        a, b = lives[True].opts[name].state_dict()["state"], lives[False].opts[name].state_dict()["state"]
+        for i in b:
+            for key, v in b[i].items():
+                assert torch.equal(torch.as_tensor(a[i][key]), torch.as_tensor(v)), (name, i, key)
+
+
+def test_start_robustness_repeats_the_criterion_on_other_seed_blocks(tmp_path, infancy, common_start):
+    path = common_start / "checkpoints" / "common_start.pt"
+    d = run_experiment(life_config(tmp_path, infancy, *FEED, *EASY, "experiment=start_robustness",
+                                   f"agent.start={path.as_posix()}", "feeding.robustness_offsets=[1000]"))
+    r = json.loads((d / "robustness.json").read_text(encoding="utf-8"))
+    assert [e["seed_offset"] for e in r["evals"]] == [0, 1000]
+    last = json.loads((common_start / "feeding_summary.json").read_text(encoding="utf-8"))["evals"][-1]
+    assert r["evals"][0]["histories"] == last["histories"]  # offset 0 is the very evaluation that passed
+    assert r["evals"][1]["histories"] != last["histories"]  # another block: other worlds
 
 
 def test_life_from_the_common_start_and_the_development_report(tmp_path, infancy, common_start):

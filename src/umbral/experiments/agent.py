@@ -217,6 +217,34 @@ def energy_zero_summary(beh: dict[str, list[float]] | None) -> dict[str, Any] | 
             "longest_run_steps": float(run.max()) if len(run) else 0.0}
 
 
+@register("start_robustness")
+def run_start_robustness(config: Config, recorder: Recorder, np_rng: np.random.Generator,
+                         resume: Checkpoint | None) -> None:
+    """The feeding criterion again on ``agent.start``, with other seed blocks (informative only).
+
+    One ``feeding_eval`` per ``feeding.robustness_offsets`` entry (seeds
+    ``FEEDING_EVAL_SEED_BASE + offset + i``), plus the original block (offset 0) for
+    reference. Writes ``robustness.json``; it decides nothing.
+    """
+    from umbral.mind.life import feeding_eval
+
+    if not config.agent.start:
+        raise ValueError("agent.start must point to common_start.pt")
+    ckpt = load_checkpoint(Path(str(config.agent.start)))
+    agent, _ = load_agent(ckpt)
+    out = {"checkpoint": str(config.agent.start), "step": ckpt.step, "evals": []}
+    for off in [0, *[int(o) for o in config.feeding.robustness_offsets]]:
+        ev = feeding_eval(agent, config, off)
+        out["evals"].append(ev)
+        for h, v in ev["histories"].items():
+            recorder.log(f"offset {off} h{h}: below 0.1 {v['fraction_below_0.1']:.4f}  below 0.3 "
+                         f"{v['fraction_below_0.3']:.4f}  food/1000 {v['food_per_1000_steps']:.3f}  "
+                         f"{'ok' if v['passed'] else 'FAIL'}")
+        recorder.log(f"offset {off}: {'passed' if ev['passed'] else 'not passed'}")
+    recorder.update_meta(agent_checkpoint=str(config.agent.start), agent_step=ckpt.step)
+    (recorder.run_dir / "robustness.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+
+
 @register("behavior_battery")
 def run_behavior_battery(config: Config, recorder: Recorder, np_rng: np.random.Generator,
                          resume: Checkpoint | None) -> None:

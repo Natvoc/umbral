@@ -33,7 +33,10 @@ Common childhood, in two parts, then the own life:
 Own life: it starts from ``agent.start`` (``common_start.pt``): mind, actor, critic,
 normalization, both optimizers and the curiosity running mean, all identical. Only
 the temperament and the seed change, and the reward scaler starts afresh: it
-measured the returns of another mix of drives. (With ``agent.start`` null it starts
+measured the returns of another mix of drives. With ``life.reset_action_std`` the
+actor's ``log_std`` goes back to ``agent.init_log_std``: the childhood keeps what to
+do (the actor's mean), and every life starts as free to explore how (the childhood
+had narrowed the action std to x0.26). (With ``agent.start`` null it starts
 from part 1 with a new actor and critic, as before 21 Nov 2026.) It lives in its
 history with its temperament: ``life.n_envs`` bodies in parallel, all in the same
 history, each restarting with a new seed and full energy every
@@ -153,7 +156,7 @@ def feeding_histories(config: Config, n: int) -> list[str]:
 
 
 @torch.no_grad()
-def feeding_eval(agent: Agent, config: Config) -> dict[str, Any]:
+def feeding_eval(agent: Agent, config: Config, seed_offset: int = 0) -> dict[str, Any]:
     """The termination criterion of the common feeding phase.
 
     ``feeding.eval_envs_per_history`` bodies per history, full cost (metabolism 1),
@@ -162,12 +165,13 @@ def feeding_eval(agent: Agent, config: Config) -> dict[str, Any]:
     Pure with respect to the agent and the global RNGs. A history passes if its
     fraction of steps below 0.1 < ``max_below_01``, below 0.3 < ``max_below_03`` and
     food per 1000 steps >= ``min_food_per_1000``; ``passed`` if every history does.
+    ``seed_offset`` shifts the seed block (``start_robustness``: the same test on other worlds).
     """
     fc = config.feeding
     k = int(fc.eval_envs_per_history)
     hist = feeding_histories(config, k * len(config.world.histories))
     n, T = len(hist), int(fc.eval_steps)
-    seeds = [FEEDING_EVAL_SEED_BASE + i for i in range(n)]
+    seeds = [FEEDING_EVAL_SEED_BASE + int(seed_offset) + i for i in range(n)]
     env = BatchedUmbralEnv(config, n, hist)
     env.reset(seed=seeds)
     env.metabolism[...] = 1.0
@@ -198,6 +202,7 @@ def feeding_eval(agent: Agent, config: Config) -> dict[str, Any]:
                            and v["food_per_1000_steps"] >= float(fc.min_food_per_1000))
         out["histories"][name] = v
     out["passed"] = all(v["passed"] for v in out["histories"].values())
+    out["seed_offset"] = int(seed_offset)
     return out
 
 
@@ -300,6 +305,12 @@ class Life:
                     self.opts[k].load_state_dict(start.optimizers[k])
                 self.drives.set_state(start.extra["drives"])
                 recorder.update_meta(start=str(config.agent.start), start_step=start.step)
+                if lc.reset_action_std:  # the childhood keeps WHAT to do; every life explores HOW afresh
+                    trained = self.agent.policy.log_std.detach().tolist()
+                    with torch.no_grad():
+                        self.agent.policy.log_std.fill_(float(config.agent.init_log_std))
+                    recorder.update_meta(action_log_std_from_start=trained,
+                                         action_log_std_reset_to=float(config.agent.init_log_std))
             else:
                 infancy = load_checkpoint(Path(str(config.agent.infancy)))
                 world.load_state_dict(infancy.models["efference"])

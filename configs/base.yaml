@@ -191,6 +191,8 @@ life:
   log_every: 10
   checkpoint_every: 50          # resumable checkpoints (multiple of log_every)
   stop_at: null                 # stop (paused, resumable) after this iteration; null = live to the end
+  reset_action_std: true        # at the start of a life from agent.start, the actor's log_std goes back to agent.init_log_std
+                                #   (the childhood keeps WHAT to do; every life starts as free to explore HOW)
   protected_infancy:            # the cost of living (basal + effort) starts lower and rises linearly ...
     start_factor: 0.25          # ... from this factor ...
     fraction: 0.2               # ... to 1 over this share of the life (the same for every agent and history)
@@ -207,7 +209,7 @@ ppo:
   ent_coef: 0.001               # keeps the policy from collapsing into stillness
   grad_clip: 0.5
 
-feeding:                        # experiment=common_feeding: common childhood part 2, learning to eat (hunger only, the 4 histories mixed)
+feeding:                        # experiment=common_feeding: common childhood part 2, learning to eat (the 4 histories mixed)
   ramp_window: 20               # competence ramp: the cost factor (from protected_infancy.start_factor) steps up by the
   ramp_max_below_01: 0.01       #   life ramp's slope only if, over the last ramp_window iterations and all bodies,
   ramp_min_p10: 0.3             #   the fraction below 0.1 < this and the energy p10 >= this; otherwise it stays (never falls)
@@ -220,6 +222,7 @@ feeding:                        # experiment=common_feeding: common childhood pa
   max_hours: 3.0                # time cap: stop with status timeout
   temperament: equilibrado      # the childhood is lived with these drive weights (null = hunger only, as on 21 Nov)
   caution_scale: 50.0           # the childhood's caution scale (provisional; overrides drives.caution_scale here only)
+  robustness_offsets: [100000, 200000]  # experiment=start_robustness: the criterion again on agent.start, seeds shifted by these
 
 ethics:                         # aversive signals at the minimum; see docs/protocolo.md
   low_energy: 0.1               # energy below this counts as "very low"
@@ -250,5 +253,5 @@ population:
   histories: ["0", "1", "2", "3"]
   seeds: [0, 1, 2]
   max_agents: null              # agents to run in this session (null = all pending)
-  parallel: 2                   # agents run at once (processes), torch.num_threads split among them: 2 x 2 threads (~1.7x the throughput of 1 x 4)
+  parallel: 1                   # agents run at once (processes); 1 since 21 Nov 2026: with 2 the laptop ran out of memory twice
   overrides: []                 # extra overrides passed to every agent run
