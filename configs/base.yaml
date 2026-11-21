@@ -176,7 +176,7 @@ agent:
   temperament: equilibrado      # key into temperaments
   history: 0                    # the agent lives in one history (all its parallel bodies)
   infancy: runs/20261116-152329_fase2a/checkpoints/update_0098000.pt  # common childhood, part 1 (Phase 2a); also the prediction-check baseline
-  start: null                   # common childhood, part 2: common_start.pt of experiment=common_feeding (null = new actor and critic)
+  start: runs/20261121-141752_fase2b_infancia_equilibrado/checkpoints/common_start.pt                   # common childhood, part 2: common_start.pt of experiment=common_feeding (null = new actor and critic)
   width: 128                    # actor and critic MLP width
   init_log_std: -0.5
 
