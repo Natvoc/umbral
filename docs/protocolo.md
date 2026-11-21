@@ -226,6 +226,16 @@ Métricas de tacto del modelo predictivo, definidas el 16 de noviembre de 2026, 
     - **Peso de cada impulso en la recompensa:** al principio dominaba la curiosidad (hambre 15 %, curiosidad 56 %, cautela 29 %). Al final: hambre 43 %, curiosidad 38 %, cautela 19 %.
     - **La exploración se redujo más que con solo hambre:** la desviación de la acción pasó de 0,607 a 0,160 (×0,26, frente a ×0,46). El punto de partida es más determinista, y eso puede limitar cuánto se diferencian los temperamentos.
     - **Batería del punto de partida** (abundancia, 8 episodios, `runs/20261121-152720_calib5_bat_common_start_h0`): energía media de 0,80, ningún tiempo bajo 0,3 ni en cero, de 5 a 8 comidas por episodio, esfuerzo de unos 0,13 y acercamiento en todas las sondas con dato.
+    - **Robustez del punto de partida** (solo informativa, no es condición para seguir; pedida por la investigadora porque la pasada fue tras oscilaciones; `experiment=start_robustness`, `runs/20261121-154024_fase2b_robustez_punto_de_partida`). Es el mismo criterio sobre `common_start.pt`, con otros dos bloques de semillas de evaluación (desplazados en 100.000 y 200.000). El bloque original reproduce exactamente la pasada.
+
+      | Historia | Bloque original (bajo 0,1 / bajo 0,3 / comida) | +100.000 | +200.000 |
+      |---|---|---|---|
+      | Abundancia | 0,0 % / 0,0 % / 1,62 | 0,0 % / 0,0 % / 1,89 | 0,0 % / 0,0 % / 1,71 |
+      | Escasez | 0,0 % / 0,0 % / 1,53 | 0,0 % / 0,0 % / 1,59 | 0,0 % / 0,9 % / 1,50 |
+      | Corredores | 1,2 % / 4,3 % / 1,34 | **2,4 %** / 4,5 % / 1,40 | **6,2 %** / **10,3 %** / 1,31 |
+      | Oasis | 0,0 % / 0,0 % / 1,83 | 0,0 % / 0,2 % / 1,65 | 0,0 % / 0,0 % / 1,95 |
+
+      Abundancia, escasez y oasis pasan con holgura en los tres bloques. Corredores falla en los dos bloques nuevos: es la historia frágil del punto de partida. El criterio no se tocó y `common_start.pt` se mantiene como punto de partida.
 - Toda pérdida es reversible: el cuerpo se restituye al final de cada condición.
 - Periodos sin cuerpo acotados y definidos de antemano.
 - Criterio escrito de qué patrones se tratarían como "posible malestar" (por ejemplo, búsqueda persistente y desorganizada) y qué se hace si aparecen: acortar o detener esa condición.
