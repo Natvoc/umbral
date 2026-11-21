@@ -217,7 +217,9 @@ feeding:                        # experiment=common_feeding: common childhood pa
   max_below_01: 0.02            # criterion, in every history: fraction of steps below 0.1 < this ...
   max_below_03: 0.10            # ... below 0.3 < this ...
   min_food_per_1000: 1.0        # ... and food per 1000 steps >= this
-  max_hours: 2.0                # time cap: stop with status timeout
+  max_hours: 3.0                # time cap: stop with status timeout
+  temperament: equilibrado      # the childhood is lived with these drive weights (null = hunger only, as on 21 Nov)
+  caution_scale: 50.0           # the childhood's caution scale (provisional; overrides drives.caution_scale here only)
 
 ethics:                         # aversive signals at the minimum; see docs/protocolo.md
   low_energy: 0.1               # energy below this counts as "very low"

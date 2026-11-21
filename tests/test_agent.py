@@ -229,18 +229,17 @@ def common_start(tmp_path_factory, infancy):
     return d
 
 
-def test_feeding_phase_is_hunger_only_over_all_histories_and_stops_at_the_criterion(common_start, infancy):
+def test_feeding_phase_is_equilibrado_over_all_histories_and_stops_at_the_criterion(common_start, infancy):
     d = common_start
     meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
     assert meta["life_status"] == "completed" and meta["feeding_phase"] is True
-    assert meta["histories_of_bodies"] == ["0", "1", "2", "3"] and meta["temperament"] == "hambre"
+    assert meta["histories_of_bodies"] == ["0", "1", "2", "3"] and meta["temperament"] == "equilibrado"
     ck = load_checkpoint(d / "checkpoints" / "common_start.pt")
     assert ck.step == 2 and not (d / "checkpoints" / "life_short.pt").exists()
     rows = [json.loads(line) for line in read_metrics(d)]
-    for k in ("curiosity", "caution"):  # weigh 0 ...
-        assert all(r["value"] == 0.0 for r in rows if r["name"] == f"contrib_{k}_abs")
-    assert any(r["name"] == "contrib_hunger_abs" and r["value"] > 0 for r in rows)
-    assert ck.extra["drives"]["error_mean"] is not None  # ... but the curiosity running mean is tracked
+    for k in ("hunger", "curiosity", "caution"):
+        assert any(r["name"] == f"contrib_{k}_abs" and r["value"] > 0 for r in rows), k
+    assert ck.extra["drives"]["error_mean"] is not None
     assert {f"criterion_h{h}_food_per_1000_steps" for h in "0123"} <= {r["name"] for r in rows}
     for h in "0123":  # per history, every iteration
         for k in ("energy", "energy_below_0.1", "food_per_1000_steps"):
@@ -251,6 +250,24 @@ def test_feeding_phase_is_hunger_only_over_all_histories_and_stops_at_the_criter
     assert set(s["evals"][0]["histories"]) == {"0", "1", "2", "3"}
     assert len(s["log_std"]["init"]) == 6 and s["log_std"]["init_mean"] == pytest.approx(-0.5)
     assert (d / "feeding_criterion.png").is_file()
+
+
+def test_feeding_drives_use_the_childhood_caution_scale_or_hunger_only(tmp_path, infancy):
+    from umbral.mind.life import Life
+    from umbral.recorder import Recorder
+
+    cfg = feeding_config(tmp_path, infancy, "drives.caution_scale=100", "feeding.caution_scale=50")
+    with Recorder(cfg) as rec:
+        life = Life(cfg, rec, np.random.default_rng(0), None, feeding=True)
+    assert life.temperament.name == "equilibrado" and life.drives.caution_scale == 50.0
+    with Recorder(cfg) as rec:  # a life keeps drives.caution_scale
+        assert Life(cfg, rec, np.random.default_rng(0), None).drives.caution_scale == 100.0
+    d = run_experiment(feeding_config(tmp_path, infancy, *EASY, "feeding.temperament=null", "run.name=hungeronly"))
+    assert json.loads((d / "meta.json").read_text(encoding="utf-8"))["temperament"] == "hambre"
+    rows = [json.loads(line) for line in read_metrics(d)]
+    for k in ("curiosity", "caution"):  # weigh 0, but the curiosity running mean is still tracked
+        assert all(r["value"] == 0.0 for r in rows if r["name"] == f"contrib_{k}_abs")
+    assert load_checkpoint(d / "checkpoints" / "common_start.pt").extra["drives"]["error_mean"] is not None
 
 
 def test_feeding_eval_is_pure_and_seeds_are_disjoint(tmp_path, infancy, common_start):
@@ -386,7 +403,7 @@ def test_life_from_the_common_start_and_the_development_report(tmp_path, infancy
     beh = run_experiment(load_config(BASE_CONFIG, [f"run.output_dir={tmp_path.as_posix()}",
                                                    "experiment=behavior_battery", f"behavior.checkpoint={path.as_posix()}",
                                                    "behavior.history=0", *TINY_LIFE]))
-    assert json.loads((beh / "meta.json").read_text(encoding="utf-8"))["temperament"] == "hambre"
+    assert json.loads((beh / "meta.json").read_text(encoding="utf-8"))["temperament"] == "equilibrado"
     rep = run_experiment(load_config(BASE_CONFIG, [f"run.output_dir={tmp_path.as_posix()}", "experiment=agent_report",
                                                    f"report.agents=[{d.as_posix()}]", "behavior.n_boot=20",
                                                    f"report.start_behavior={beh.as_posix()}"]))

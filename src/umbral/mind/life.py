@@ -6,8 +6,11 @@ Common childhood, in two parts, then the own life:
    normalization; ``agent.infancy``).
 2. *Learning to eat* (``Life(feeding=True)``, experiment ``common_feeding``): one
    shared phase, the same for every agent. It starts from part 1 with a new actor and
-   critic, and hunger is its only drive (curiosity and caution weigh 0; the curiosity
-   running mean is still tracked, so it reaches the lives calibrated). The bodies are
+   critic and is lived with the drives of ``feeding.temperament`` (equilibrado since
+   21 Nov 2026; curiosity gated by hunger, as in the lives) and its own caution scale
+   ``feeding.caution_scale``. With ``feeding.temperament`` null, hunger is the only
+   drive (the curiosity running mean is tracked anyway, so it reaches the lives
+   calibrated). The bodies are
    spread over the 4 histories (``life.n_envs / 4`` each), so eating does not depend
    on one world; the episode stagger is dealt round-robin over the histories
    (``stagger``), so a body's episode age is not tied to its history, and energy,
@@ -258,7 +261,8 @@ class Life:
         self.stop_at = None if lc.stop_at is None else int(lc.stop_at)
         self.episode_rollouts = int(lc.episode_steps) // self.T
         if self.feeding:
-            self.temperament = HUNGER_ONLY
+            ft = config.feeding.temperament
+            self.temperament = HUNGER_ONLY if ft is None else temperament_from_config(config, str(ft))
             self.history = "all"
             self.histories = feeding_histories(config, self.N)
             fc = config.feeding
@@ -282,6 +286,8 @@ class Life:
         self.opts = {"world": torch.optim.Adam(world.parameters(), lr=float(lc.world_lr)),
                      "policy": torch.optim.Adam(self.agent.policy.parameters(), lr=float(pc.lr))}
         self.drives = Drives(layout, config.drives, self.temperament, self.env.params.effort_cost)
+        if self.feeding and config.feeding.caution_scale is not None:
+            self.drives.caution_scale = float(config.feeding.caution_scale)  # the childhood's own caution scale
         self.scaler = RewardScaler(self.N, float(pc.gamma))
         self.noise = GaussianNoise(self.N, [0] * self.N)
 
