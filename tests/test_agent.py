@@ -12,6 +12,7 @@ from umbral.body.sensors import ObsLayout
 from umbral.checkpoint import load_checkpoint
 from umbral.cli import run_experiment
 from umbral.config import load_config
+from umbral.experiments.agent import load_agent
 from umbral.mind.agent import Agent
 from umbral.mind.drives import (Drives, RewardScaler, Temperament, caution_reward, hunger_gate, hunger_reward,
                                 world_prediction_error)
@@ -207,6 +208,133 @@ def test_life_resume_reproduces_the_continuation(tmp_path, infancy):
     assert set(a.optimizers) == {"world", "policy"}
     names = {json.loads(line)["name"] for line in read_metrics(full)}
     assert {"ppo_approx_kl", "ppo_clip_fraction", "reward_curiosity", "energy_below_0.1"} <= names
+
+
+# --- the common childhood, part 2: learning to eat ------------------------------------------
+
+FEED = ["experiment=common_feeding", "feeding.eval_from=2", "feeding.eval_every=2", "feeding.eval_envs_per_history=1",
+        "feeding.eval_steps=20"]
+EASY = ["feeding.max_below_01=1.01", "feeding.max_below_03=1.01", "feeding.min_food_per_1000=0"]
+IMPOSSIBLE = ["feeding.min_food_per_1000=1e9"]
+
+
+def feeding_config(tmp_path, infancy, *overrides):
+    return life_config(tmp_path, infancy, *FEED, *overrides)
+
+
+@pytest.fixture(scope="module")
+def common_start(tmp_path_factory, infancy):
+    d = run_experiment(feeding_config(tmp_path_factory.mktemp("feeding"), infancy, *EASY, "run.name=feed"))
+    return d
+
+
+def test_feeding_phase_is_hunger_only_over_all_histories_and_stops_at_the_criterion(common_start, infancy):
+    d = common_start
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    assert meta["life_status"] == "completed" and meta["feeding_phase"] is True
+    assert meta["histories_of_bodies"] == ["0", "1", "2", "3"] and meta["temperament"] == "hambre"
+    ck = load_checkpoint(d / "checkpoints" / "common_start.pt")
+    assert ck.step == 2 and not (d / "checkpoints" / "life_short.pt").exists()
+    rows = [json.loads(line) for line in read_metrics(d)]
+    for k in ("curiosity", "caution"):  # weigh 0 ...
+        assert all(r["value"] == 0.0 for r in rows if r["name"] == f"contrib_{k}_abs")
+    assert any(r["name"] == "contrib_hunger_abs" and r["value"] > 0 for r in rows)
+    assert ck.extra["drives"]["error_mean"] is not None  # ... but the curiosity running mean is tracked
+    assert {f"criterion_h{h}_food_per_1000_steps" for h in "0123"} <= {r["name"] for r in rows}
+    s = json.loads((d / "feeding_summary.json").read_text(encoding="utf-8"))
+    assert s["status"] == "completed" and len(s["evals"]) == 1 and s["evals"][0]["iteration"] == 2
+    assert set(s["evals"][0]["histories"]) == {"0", "1", "2", "3"}
+    assert len(s["log_std"]["init"]) == 6 and s["log_std"]["init_mean"] == pytest.approx(-0.5)
+    assert (d / "feeding_criterion.png").is_file()
+
+
+def test_feeding_eval_is_pure_and_seeds_are_disjoint(tmp_path, infancy, common_start):
+    from umbral.mind.life import FEEDING_SEED_BASE, Life, feeding_eval
+    from umbral.recorder import Recorder
+
+    cfg = feeding_config(tmp_path, infancy, *EASY)
+    agent, _ = load_agent(load_checkpoint(common_start / "checkpoints" / "common_start.pt"))
+    before = {k: v.clone() for k, v in agent.state_dict().items()}
+    rng_before = torch.get_rng_state()
+    a, b = feeding_eval(agent, cfg), feeding_eval(agent, cfg)
+    assert a == b and torch.equal(rng_before, torch.get_rng_state())
+    for k, v in agent.state_dict().items():
+        assert torch.equal(v, before[k])
+    with Recorder(cfg) as rec:
+        life = Life(cfg, rec, np.random.default_rng(0), None, feeding=True)
+        assert all(FEEDING_SEED_BASE <= life._new_seed() < FEEDING_SEED_BASE + 2**31 for _ in range(50))
+        assert life.histories == ["0", "1", "2", "3"]
+
+
+def test_feeding_phase_stops_at_the_time_cap_without_a_starting_point(tmp_path, infancy):
+    d = run_experiment(feeding_config(tmp_path, infancy, *IMPOSSIBLE, "feeding.max_hours=0", "run.name=cap"))
+    s = json.loads((d / "feeding_summary.json").read_text(encoding="utf-8"))
+    assert s["status"] == "timeout" and s["common_start"] is None
+    assert not (d / "checkpoints" / "common_start.pt").exists()
+
+
+def test_feeding_resume_reproduces_the_continuation(tmp_path, infancy):
+    full = run_experiment(feeding_config(tmp_path, infancy, *IMPOSSIBLE, "run.name=ffull"))
+    assert json.loads((full / "meta.json").read_text(encoding="utf-8"))["life_status"] == "timeout"
+    ck = full / "checkpoints" / "iter_0000002.pt"
+    resumed = run_experiment(feeding_config(tmp_path, infancy, *IMPOSSIBLE, "run.name=fres",
+                                            f"run.resume_from={ck.as_posix()}"))
+    tail = [line for line in read_metrics(full) if json.loads(line)["step"] > 2]
+    assert len(tail) > 0 and read_metrics(resumed) == tail
+    a = json.loads((full / "feeding_summary.json").read_text(encoding="utf-8"))
+    b = json.loads((resumed / "feeding_summary.json").read_text(encoding="utf-8"))
+    assert a["evals"] == b["evals"] and len(a["evals"]) == 3 and a["log_std"] == b["log_std"]
+
+
+def test_lives_start_exactly_from_the_common_starting_point(tmp_path, infancy, common_start):
+    from umbral.mind.life import Life
+    from umbral.recorder import Recorder
+
+    path = common_start / "checkpoints" / "common_start.pt"
+    ck = load_checkpoint(path)
+    for temperament, seed in (("curioso", 3), ("cauteloso", 4)):
+        cfg = life_config(tmp_path, infancy, f"agent.start={path.as_posix()}", f"agent.temperament={temperament}",
+                          f"seed={seed}")
+        with Recorder(cfg) as rec:
+            life = Life(cfg, rec, np.random.default_rng(seed), None)
+        assert life.temperament.name == temperament
+        sd = life.agent.state_dict()
+        assert set(sd) == set(ck.models["agent"])  # mind (with its frozen normalization), actor and critic
+        for k, v in ck.models["agent"].items():
+            assert torch.equal(sd[k], v), k
+        for name in ("world", "policy"):
+            got, want = life.opts[name].state_dict()["state"], ck.optimizers[name]["state"]
+            assert set(got) == set(want)
+            for i in want:
+                for key, v in want[i].items():
+                    assert torch.equal(torch.as_tensor(got[i][key]), torch.as_tensor(v)), (name, i, key)
+        assert life.drives.get_state() == ck.extra["drives"]
+        fresh = RewardScaler(life.N, float(cfg.ppo.gamma))
+        got, want = life.scaler.get_state(), fresh.get_state()  # the reward scaler starts afresh
+        assert set(got) == set(want)
+        for k in want:
+            np.testing.assert_array_equal(np.asarray(got[k]), np.asarray(want[k]), err_msg=k)
+        np.testing.assert_array_equal(life.scaler.ret, fresh.ret)
+
+
+def test_life_from_the_common_start_and_the_development_report(tmp_path, infancy, common_start):
+    path = common_start / "checkpoints" / "common_start.pt"
+    d = run_experiment(life_config(tmp_path, infancy, f"agent.start={path.as_posix()}", "run.name=fromstart"))
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    assert meta["life_status"] == "completed" and meta["start"] == path.as_posix() and "infancy" not in meta
+    beh = run_experiment(load_config(BASE_CONFIG, [f"run.output_dir={tmp_path.as_posix()}",
+                                                   "experiment=behavior_battery", f"behavior.checkpoint={path.as_posix()}",
+                                                   "behavior.history=0", *TINY_LIFE]))
+    assert json.loads((beh / "meta.json").read_text(encoding="utf-8"))["temperament"] == "hambre"
+    rep = run_experiment(load_config(BASE_CONFIG, [f"run.output_dir={tmp_path.as_posix()}", "experiment=agent_report",
+                                                   f"report.agents=[{d.as_posix()}]", "behavior.n_boot=20",
+                                                   f"report.start_behavior={beh.as_posix()}"]))
+    report = json.loads((rep / "report.json").read_text(encoding="utf-8"))
+    dev = next(iter(report["development"].values()))
+    assert set(dev["means"]["effort"]) == {"start", "short", "long"}
+    ez = report["energy_zero"]
+    assert ez["start"]["episodes"] == 2
+    assert next(v for k, v in ez.items() if k != "start")["behavior"]["episodes"] == 2
 
 
 def test_life_report_writes_behavior_and_prediction_check(tmp_path, infancy):

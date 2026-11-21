@@ -87,11 +87,38 @@ Una red recurrente pequeña, de cientos de miles de parámetros, entrenada desde
 - **Un solo cambio a la vez:** la infancia protegida y los pesos de los temperamentos quedan como estaban. `g(E)` se registra en cada iteración junto con la contribución de cada impulso.
 - **Los cuerpos uno por uno:** la regla ética mide sobre todos los cuerpos en paralelo, y la media puede verse sana mientras algunos están agotados. Al detenerse, el curioso de la escala 25 tenía una energía media de 0,53, pero 4 de sus 32 cuerpos estaban bajo 0,1 (uno en 0,00) y el percentil 10 era 0,07. Desde entonces, cada vida registra en cada iteración, y por fase en su resumen, la energía mínima y el percentil 10 entre los cuerpos.
 
+**La infancia común, en dos partes (21 de noviembre de 2026, Fase 2b).**
+
+- **Qué es:**
+  1. *Aprender el cuerpo:* el modelo predictivo de la Fase 2a, sin cambios (`agent.infancy`).
+  2. *Aprender a comer (nueva):* una sola fase compartida, igual para todos los agentes (`experiment=common_feeding`). Parte del checkpoint de la 2a con un actor y un crítico nuevos.
+- **Cómo es la fase de comer:**
+  - El único impulso es el hambre: curiosidad y cautela pesan 0. La media móvil del error de curiosidad se sigue calculando, para que llegue calibrada a las vidas.
+  - El modelo predictivo sigue aprendiendo, solo con la pérdida de predicción.
+  - Los 32 cuerpos se reparten entre las 4 historias (8 en cada una), para que comer no dependa de un mundo en particular.
+  - Tiene la misma infancia protegida que una vida (la rampa del costo, de 0,25 a 1 en 720 iteraciones de una duración nominal de 3.600) y termina con costo completo. La regla ética se aplica igual: si se dispara, se detiene y se avisa a la investigadora.
+  - Sus semillas son propias: los entornos de entrenamiento salen de `[3·2³¹, 4·2³¹)`, disjunto del entrenamiento de las vidas, de la evaluación y de la normalización. El criterio de término usa `2³¹ + 4.000.000 + i`.
+- **Por qué:** con la modulación por hambre corregida, las tres escalas de la cautela (25, 50 y 100) fallaron en la misma ventana, las iteraciones 150 a 250, y con temperamentos distintos (curioso en 25 y 100, equilibrado en 50). Las vidas que pasaban esa ventana terminaban sanas y bien diferenciadas. La causa común es que el actor empezaba sin saber comer mientras subía el costo de vivir. El problema estaba en el punto de partida de la conducta, no en la cautela.
+- **Criterio de término (fijado antes de entrenar):**
+  - **Cómo se evalúa:** a partir del fin de la rampa (iteración 720) y después cada 100 iteraciones. Con costo completo, energía inicial llena, política estocástica, sin aprendizaje y con semillas de evaluación fijas. Son 8 cuerpos por historia, durante un episodio de 4.096 pasos.
+  - **Cuándo pasa:** cada una de las 4 historias debe cumplir, por separado, fracción del tiempo bajo 0,1 < 2 %, fracción bajo 0,3 < 10 % y comida ≥ 1 cada 1.000 pasos.
+  - **Al cumplirse** se guarda `common_start.pt`, el **punto de partida único de todas las vidas**.
+  - **Tope:** 2 horas de reloj (o las 3.600 iteraciones). Si se alcanza sin cumplir el criterio, se detiene (`timeout`) y se revisan los datos.
+- **Qué hereda cada vida** (`agent.start`): la mente con su normalización congelada, el actor, el crítico (con su `log_std`), los dos optimizadores y la media de la curiosidad. Todo es idéntico al punto de partida (hay un test que lo comprueba). Solo cambian el temperamento y la semilla. La normalización de la recompensa (`RewardScaler`) se reinicia igual para todos, porque medía los retornos de otra mezcla de impulsos y no es parte del modelo de sí mismo. Todo lo demás de la vida queda igual: su infancia protegida (la misma rampa), la modulación de la curiosidad, los pesos de los temperamentos, la regla ética, las medidas y los checkpoints de vida corta y vida larga.
+- **Se reporta:** la curva del criterio por historia y el `log_std` del actor en `common_start.pt` frente al de su inicialización. Si la fase de comer redujo mucho la exploración, a los temperamentos podría costarles separarse. Solo se reporta, sin ajustar nada por eso.
+- **La comprobación de predicción** sigue comparando con el modelo de la 2a (`agent.infancy`).
+
 ## Diseño experimental
 
 Cada agente se entrena una sola vez; después se clona en el punto de pérdida y cada copia pasa por una condición distinta. Así se compara el mismo individuo bajo condiciones diferentes, sin multiplicar el entrenamiento.
 
-**Población inicial (ajustable):** 3 temperamentos × 4 historias (versiones del mundo) × 3 semillas = 36 agentes. Todos parten de una infancia común (el modelo predictivo de la Fase 2a) y luego viven una vida propia, con su temperamento y su historia, en la que siguen aprendiendo su cuerpo y forman su personaje (decidido el 17 de noviembre).
+**Población inicial (ajustable):** 3 temperamentos × 4 historias (versiones del mundo) × 3 semillas = 36 agentes. Todos parten de una infancia común y luego viven una vida propia, con su temperamento y su historia, en la que siguen aprendiendo su cuerpo y forman su personaje (decidido el 17 de noviembre).
+
+**La infancia común tiene dos partes (desde el 21 de noviembre de 2026):** aprender el cuerpo (el modelo predictivo de la Fase 2a) y aprender a comer (una fase compartida, solo con hambre, en las 4 historias; ver La mente). Su resultado, `common_start.pt`, es el único punto de partida de todas las vidas.
+
+- **Consecuencia para la interpretación:** el punto de partida de la conducta es compartido. Antes de vivir, la política no depende del temperamento (el temperamento solo cambia la recompensa), así que los tres temperamentos se comportan igual. Las diferencias de carácter que aparezcan vienen, entonces, del temperamento y de la vida propia, no de cómo cada agente aprendió a comer.
+- **Para medirlo:** la batería de comportamiento se corre una vez en el punto de partida común. Esa medición es la línea base de los tres temperamentos, y se compara con el final de la vida corta y de la vida larga, para ver cuánto del carácter sale de la vida propia.
+- La calibración de la cautela se repite desde este punto de partida, con las mismas escalas (25, 50 y 100), los tres temperamentos, 2 semillas y las mismas tres condiciones. Las vidas de calibración anteriores quedan marcadas `superseded`.
 
 | Factor | Niveles | Cómo se obtiene |
 | --- | --- | --- |

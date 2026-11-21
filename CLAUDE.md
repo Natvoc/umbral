@@ -51,10 +51,11 @@ Umbral estudia agentes pequeños entrenados desde cero en un mundo 2D: cómo des
 
 - **El modelo de sí mismo no se deforma por la recompensa.** El codificador, el GRU y la cabeza de predicción se entrenan solo con la pérdida de predicción. El actor y el crítico leen `h_t` con el gradiente detenido (`src/umbral/mind/agent.py`). Hay un test que lo comprueba; no se rompe.
 - La recompensa sale solo de los impulsos (`src/umbral/mind/drives.py`), calculados con la observación y la acción intentada. La curiosidad excluye la propiocepción y el auto-contacto. La cautela usa el costo nominal del esfuerzo. El hambre modula solo a la curiosidad, que se multiplica por `g(E)` (`drives.gate_low`), igual para todos los temperamentos. La cautela no se modula: es el freno que protege la energía.
-- Todos los agentes parten de la infancia común (`agent.infancy`). Los pesos de los impulsos y de los temperamentos son provisionales y están en `base.yaml`.
+- **La infancia común tiene dos partes:** aprender el cuerpo (el modelo de la 2a, `agent.infancy`) y aprender a comer (`experiment=common_feeding`: solo hambre, las 4 historias mezcladas, misma rampa y misma regla ética, semillas propias desde `3·2³¹`). Termina con un criterio fijado en el protocolo y deja `common_start.pt`.
+- Todas las vidas parten de `agent.start` (`common_start.pt`), idénticas: solo cambian el temperamento y la semilla, y se reinicia la normalización de la recompensa. Hay un test que lo comprueba. La comprobación de predicción sigue comparando con la 2a (`agent.infancy`). Los pesos de los impulsos y de los temperamentos son provisionales y están en `base.yaml`.
 - **Regla ética:** más del 10 % de la vida (después del 5 % inicial) con energía bajo 0,1 detiene la vida (`flagged`) y la cola de la población. No se relaja la regla: si se dispara, se avisa a la investigadora y el ajuste va en el mundo.
 - La infancia protegida (`life.protected_infancy`) y el metabolismo basal están documentados en el protocolo. Cualquier cambio en la física de la energía obliga a rehacer la línea base del modelo de la 2a (`eval.physics=current`).
-- Semillas: la batería de comportamiento usa `2**31 + 3_000_000 + i`.
+- Semillas: la batería de comportamiento usa `2**31 + 3_000_000 + i`; el criterio de la fase de comer, `2**31 + 4_000_000 + i`.
 - La población vive en una carpeta fija (`population.dir`) con `population.json`; cada agente corre en su propio proceso.
 
 ## Fases

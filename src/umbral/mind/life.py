@@ -1,7 +1,29 @@
 """The agent's own life (Phase 2b): it acts by its drives and keeps learning its body.
 
-Common childhood + own life: every agent starts from the Phase 2a predictive model
-(efference copy, frozen normalization; ``agent.infancy``). Then it lives in its
+Common childhood, in two parts, then the own life:
+
+1. *Learning the body*: the Phase 2a predictive model (efference copy, frozen
+   normalization; ``agent.infancy``).
+2. *Learning to eat* (``Life(feeding=True)``, experiment ``common_feeding``): one
+   shared phase, the same for every agent. It starts from part 1 with a new actor and
+   critic, and hunger is its only drive (curiosity and caution weigh 0; the curiosity
+   running mean is still tracked, so it reaches the lives calibrated). The bodies are
+   spread over the 4 histories (``life.n_envs / 4`` each), so eating does not depend
+   on one world. The self-model keeps learning with the prediction loss only. The
+   same protected childhood ramp and ethics rule as a life apply. Environment seeds
+   come from their own range (``FEEDING_SEED_BASE + [0, 2**31)``). Every
+   ``feeding.eval_every`` iterations from the end of the ramp, ``feeding_eval`` runs
+   the termination criterion: full cost, stochastic policy, fixed evaluation seeds
+   (``FEEDING_EVAL_SEED_BASE + i``), every history on its own. When all histories meet
+   it, ``checkpoints/common_start.pt`` is saved: the single starting point of every
+   life. If the time cap ``feeding.max_hours`` (or the nominal length) is reached
+   first, it stops with status ``timeout``.
+
+Own life: it starts from ``agent.start`` (``common_start.pt``): mind, actor, critic,
+normalization, both optimizers and the curiosity running mean, all identical. Only
+the temperament and the seed change, and the reward scaler starts afresh: it
+measured the returns of another mix of drives. (With ``agent.start`` null it starts
+from part 1 with a new actor and critic, as before 21 Nov 2026.) It lives in its
 history with its temperament: ``life.n_envs`` bodies in parallel, all in the same
 history, each restarting with a new seed and full energy every
 ``life.episode_steps`` steps (staggered).
@@ -59,13 +81,73 @@ import torch
 from umbral.checkpoint import Checkpoint, load_checkpoint, make_checkpoint, save_checkpoint
 from umbral.config import Config
 from umbral.mind.agent import Agent, GaussianNoise, build_agent
-from umbral.mind.drives import Drives, RewardScaler, temperament_from_config
+from umbral.mind.drives import Drives, RewardScaler, Temperament, temperament_from_config
 from umbral.mind.model import CHANNELS, build_model, channel_sq_error, n_parameters
-from umbral.mind.training import TRAIN_SEED_LIMIT, peak_memory_mb
+from umbral.mind.training import EVAL_SEED_BASE, POLICY_SEED_OFFSET, TRAIN_SEED_LIMIT, peak_memory_mb
 from umbral.recorder import Recorder
 from umbral.world.batched import BatchedUmbralEnv
 
 COMPONENTS = ("hunger", "curiosity", "caution")
+HUNGER_ONLY = Temperament("hambre", 0.0, 0.0)  # the drive of the common feeding phase (not a temperament)
+FEEDING_SEED_BASE = 3 * 2**31  # training seeds of the feeding phase: [3*2**31, 4*2**31), disjoint from all others
+FEEDING_EVAL_SEED_BASE = EVAL_SEED_BASE + 4_000_000  # its termination criterion (battery: +3_000_000)
+
+
+def feeding_histories(config: Config, n: int) -> list[str]:
+    """``n`` bodies spread evenly over all the histories (in blocks, in history order)."""
+    hs = sorted((str(h) for h in config.world.histories), key=int)
+    if n % len(hs):
+        raise ValueError(f"{n} bodies cannot be spread evenly over {len(hs)} histories")
+    return [h for h in hs for _ in range(n // len(hs))]
+
+
+@torch.no_grad()
+def feeding_eval(agent: Agent, config: Config) -> dict[str, Any]:
+    """The termination criterion of the common feeding phase.
+
+    ``feeding.eval_envs_per_history`` bodies per history, full cost (metabolism 1),
+    full initial energy, ``feeding.eval_steps`` steps, the stochastic policy, fixed
+    seeds (``FEEDING_EVAL_SEED_BASE + i``, noise ``+ POLICY_SEED_OFFSET``), no learning.
+    Pure with respect to the agent and the global RNGs. A history passes if its
+    fraction of steps below 0.1 < ``max_below_01``, below 0.3 < ``max_below_03`` and
+    food per 1000 steps >= ``min_food_per_1000``; ``passed`` if every history does.
+    """
+    fc = config.feeding
+    k = int(fc.eval_envs_per_history)
+    hist = feeding_histories(config, k * len(config.world.histories))
+    n, T = len(hist), int(fc.eval_steps)
+    seeds = [FEEDING_EVAL_SEED_BASE + i for i in range(n)]
+    env = BatchedUmbralEnv(config, n, hist)
+    env.reset(seed=seeds)
+    env.metabolism[...] = 1.0
+    noise = GaussianNoise(n, [s + POLICY_SEED_OFFSET for s in seeds])
+    world = agent.world
+    h = world.initial_state(n)
+    prev = np.zeros((n, 6))
+    o = env.observation()["flat"]
+    low, b03, food, esum = np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n)
+    for _ in range(T):
+        h = world.step_hidden(torch.as_tensor(o, dtype=torch.float32), torch.as_tensor(prev, dtype=torch.float32), h)
+        a, *_ = agent.act(h[0], noise.sample())
+        obs, _, _, _, info = env.step(a)
+        o, prev = obs["flat"], info["action_intended"]
+        e = info["energy"]
+        low += e < float(config.ethics.low_energy)
+        b03 += e < 0.3
+        food += info["food_eaten"]
+        esum += e
+    out: dict[str, Any] = {"histories": {}, "steps": T, "envs_per_history": k}
+    for name in dict.fromkeys(hist):
+        rows = np.array([x == name for x in hist])
+        steps = int(rows.sum()) * T
+        v = {"fraction_below_0.1": float(low[rows].sum() / steps), "fraction_below_0.3": float(b03[rows].sum() / steps),
+             "food_per_1000_steps": float(food[rows].sum() / steps * 1000), "mean_energy": float(esum[rows].sum() / steps)}
+        v["passed"] = bool(v["fraction_below_0.1"] < float(fc.max_below_01)
+                           and v["fraction_below_0.3"] < float(fc.max_below_03)
+                           and v["food_per_1000_steps"] >= float(fc.min_food_per_1000))
+        out["histories"][name] = v
+    out["passed"] = all(v["passed"] for v in out["histories"].values())
+    return out
 
 
 def gae(rewards: np.ndarray, values: np.ndarray, last_value: np.ndarray, gamma: float, lam: float
@@ -110,8 +192,9 @@ def _hist_quantile(hist: list[int] | None, q: float) -> float | None:
 
 class Life:
     def __init__(self, config: Config, recorder: Recorder, np_rng: np.random.Generator,
-                 resume: Checkpoint | None):
+                 resume: Checkpoint | None, feeding: bool = False):
         self.config, self.rec = config, recorder
+        self.feeding = bool(feeding)
         lc, pc = config.life, config.ppo
         self.N, self.T = int(lc.n_envs), int(lc.rollout)
         self.iterations = int(lc.iterations)
@@ -126,9 +209,22 @@ class Life:
         self.infancy_end = int(round(float(lc.protected_infancy.fraction) * self.iterations))
         self.stop_at = None if lc.stop_at is None else int(lc.stop_at)
         self.episode_rollouts = int(lc.episode_steps) // self.T
-        self.temperament = temperament_from_config(config, str(config.agent.temperament))
-        self.history = str(config.agent.history)
-        self.env = BatchedUmbralEnv(config, self.N, [self.history] * self.N)
+        if self.feeding:
+            self.temperament = HUNGER_ONLY
+            self.history = "all"
+            self.histories = feeding_histories(config, self.N)
+            fc = config.feeding
+            self.eval_from = self.infancy_end if fc.eval_from is None else int(fc.eval_from)
+            self.eval_every = int(fc.eval_every)
+            if self.eval_every % self.log_every or self.eval_from % self.log_every:
+                raise ValueError("feeding.eval_every and eval_from must be multiples of life.log_every")
+            self.max_seconds = float(fc.max_hours) * 3600
+        else:
+            self.temperament = temperament_from_config(config, str(config.agent.temperament))
+            self.history = str(config.agent.history)
+            self.histories = [self.history] * self.N
+        self.seed_base = FEEDING_SEED_BASE if self.feeding else 0
+        self.env = BatchedUmbralEnv(config, self.N, self.histories)
         layout = self.env.layout
 
         world = build_model(layout, config.mind, efference_copy=True)
@@ -141,11 +237,22 @@ class Life:
 
         if resume is None:
             self.np_rng = np_rng
-            infancy = load_checkpoint(Path(str(config.agent.infancy)))
-            world.load_state_dict(infancy.models["efference"])
-            self.opts["world"].load_state_dict(infancy.optimizers["efference"])
+            start = None if self.feeding or not config.agent.start else load_checkpoint(Path(str(config.agent.start)))
+            if start is not None:  # the end of the common childhood: all but temperament, seed and reward scaler
+                self.agent.load_state_dict(start.models["agent"])
+                for k in ("world", "policy"):
+                    self.opts[k].load_state_dict(start.optimizers[k])
+                self.drives.set_state(start.extra["drives"])
+                recorder.update_meta(start=str(config.agent.start), start_step=start.step)
+            else:
+                infancy = load_checkpoint(Path(str(config.agent.infancy)))
+                world.load_state_dict(infancy.models["efference"])
+                self.opts["world"].load_state_dict(infancy.optimizers["efference"])
+                recorder.update_meta(infancy=str(config.agent.infancy), infancy_step=infancy.step)
             for g in self.opts["world"].param_groups:
                 g["lr"] = float(lc.world_lr)
+            for g in self.opts["policy"].param_groups:
+                g["lr"] = float(pc.lr)
             self.noise = GaussianNoise(self.N, [self._new_seed() for _ in range(self.N)])
             self.env.reset(seed=[self._new_seed() for _ in range(self.N)])
             self.h = world.initial_state(self.N)
@@ -155,7 +262,8 @@ class Life:
             self.start, self.elapsed_before = 0, 0.0
             self.ethics = {"steps": 0, "low": 0, "below_03": 0, "food": 0, "energy_sum": 0.0}
             self.energy_curve: list[float] = []
-            recorder.update_meta(infancy=str(config.agent.infancy), infancy_step=infancy.step)
+            self.feeding_evals: list[dict[str, Any]] = []
+            self.log_std_init = self.agent.policy.log_std.detach().tolist()
         else:
             resume.load_into({"agent": self.agent}, self.opts)
             self.noise.set_state(resume.policy)
@@ -168,16 +276,19 @@ class Life:
             self.scaler.set_state(ex["scaler"])
             self.ethics = dict(ex["ethics"])
             self.energy_curve = list(ex["energy_curve"])
+            self.feeding_evals = list(ex.get("feeding_evals", []))
+            self.log_std_init = list(ex.get("log_std_init", []))
             self.start, self.elapsed_before = int(resume.step), float(ex["elapsed_seconds"])
             self.np_rng = resume.activate()
         self.times = {"world": 0.0, "mind_acting": 0.0, "predictor": 0.0, "ppo": 0.0, "io": 0.0}
         self._reset_acc()
         recorder.update_meta(
             temperament=self.temperament.name, history=self.history, n_envs=self.N, rollout=self.T,
+            feeding_phase=self.feeding, histories_of_bodies=sorted(set(self.histories), key=int),
             n_parameters={"world": n_parameters(world), "policy": n_parameters(self.agent.policy)})
 
     def _new_seed(self) -> int:
-        return int(self.np_rng.integers(0, TRAIN_SEED_LIMIT))
+        return self.seed_base + int(self.np_rng.integers(0, TRAIN_SEED_LIMIT))
 
     def _reset_acc(self) -> None:
         self.acc: dict[str, float] = {}
@@ -374,7 +485,8 @@ class Life:
             extra={"life_left": self.life_left.tolist(), "drives": self.drives.get_state(),
                    "scaler": {**self.scaler.get_state(), "ret": self.scaler.ret.tolist()},
                    "ethics": dict(self.ethics), "energy_curve": list(self.energy_curve),
-                   "elapsed_seconds": elapsed, "temperament": self.temperament.name, "history": self.history},
+                   "elapsed_seconds": elapsed, "temperament": self.temperament.name, "history": self.history,
+                   "feeding_evals": list(self.feeding_evals), "log_std_init": list(self.log_std_init)},
             env=self.env, policy=self.noise,
             mind_state={"h": self.h, "prev_action": torch.as_tensor(self.prev_action)})
         return save_checkpoint(self.rec.run_dir / "checkpoints" / f"{name}.pt", ckpt)
@@ -420,15 +532,36 @@ class Life:
                     self.checkpoint(it, f"iter_{it:07d}", elapsed)
                     status = "flagged"
                     break
-            if it == self.mid:
+                if self.feeding and it >= self.eval_from and (it - self.eval_from) % self.eval_every == 0:
+                    ev = feeding_eval(self.agent, self.config)
+                    ev["iteration"] = it
+                    self.feeding_evals.append(ev)
+                    for name, v in ev["histories"].items():
+                        for key in ("fraction_below_0.1", "fraction_below_0.3", "food_per_1000_steps", "mean_energy"):
+                            self.rec.log_metric(it, f"criterion_h{name}_{key}", v[key])
+                    self.rec.log(f"criterion at {it}: " + "  ".join(
+                        f"h{name} <0.1 {v['fraction_below_0.1']:.4f} <0.3 {v['fraction_below_0.3']:.4f} "
+                        f"food {v['food_per_1000_steps']:.2f} {'ok' if v['passed'] else 'no'}"
+                        for name, v in ev["histories"].items()))
+                    if ev["passed"]:
+                        self.checkpoint(it, "common_start", elapsed)
+                        status = "completed"
+                        break
+                if self.feeding and elapsed >= self.max_seconds:
+                    self.checkpoint(it, f"iter_{it:07d}", elapsed)
+                    status = "timeout"
+                    break
+            if it == self.mid and not self.feeding:
                 self.checkpoint(it, "life_short", elapsed)
-            if it == self.iterations:
+            if it == self.iterations and not self.feeding:
                 self.checkpoint(it, "life_long", elapsed)
             elif it % self.ckpt_every == 0 or it == end:
                 self.checkpoint(it, f"iter_{it:07d}", elapsed)
         else:
             if end < self.iterations:
                 status = "paused"
+            elif self.feeding:
+                status = "timeout"  # the whole nominal length without meeting the criterion
         wall = time.perf_counter() - wall0
         total = sum(self.times.values()) or 1.0
         summary = {
@@ -441,5 +574,8 @@ class Life:
             "peak_memory_mb": None if peak_memory_mb() is None else round(peak_memory_mb(), 1),
             "ethics": self.ethics_summary(),
         }
+        if self.feeding:
+            summary["feeding"] = {"evals": list(self.feeding_evals), "log_std_init": list(self.log_std_init),
+                                  "log_std_final": self.agent.policy.log_std.detach().tolist()}
         self.rec.update_meta(**summary)
         return summary

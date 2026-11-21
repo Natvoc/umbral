@@ -206,3 +206,33 @@ def _plot_life_curves(agent_dirs: list[Path], out_dir: Path) -> None:
     fig.tight_layout()
     fig.savefig(out_dir / "life_curves.png", dpi=110)
     plt.close(fig)
+
+
+HISTORY_COLORS = ("#3b6fb6", "#d43d3d", "#3d9a50", "#c08a2b")
+
+
+def plot_feeding(evals: list[dict], config, path: Path) -> None:
+    """The termination criterion of the common feeding phase, per history, with its thresholds."""
+    fc = config.feeding
+    panels = (("fraction_below_0.1", "fracción energía < 0,1", float(fc.max_below_01)),
+              ("fraction_below_0.3", "fracción energía < 0,3", float(fc.max_below_03)),
+              ("food_per_1000_steps", "comida cada 1.000 pasos", float(fc.min_food_per_1000)),
+              ("mean_energy", "energía media", None))
+    its = [e["iteration"] for e in evals]
+    names = list(evals[0]["histories"])
+    fig, axes = plt.subplots(1, 4, figsize=(16, 3.8), dpi=110)
+    for ax, (key, title, thr) in zip(axes, panels):
+        for i, h in enumerate(names):
+            hist = config.world.histories.get(str(h))
+            label = f"h{h}" + (f" {hist['name']}" if hist is not None and "name" in hist else "")
+            ax.plot(its, [e["histories"][h][key] for e in evals], "o-", ms=3,
+                    color=HISTORY_COLORS[i % len(HISTORY_COLORS)], label=label)
+        if thr is not None:
+            ax.axhline(thr, color="black", ls="--", lw=1)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("iteración")
+    axes[0].legend(fontsize=8)
+    fig.suptitle("Infancia común, aprender a comer: criterio de término por historia (línea: umbral)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)

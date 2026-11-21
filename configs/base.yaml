@@ -175,7 +175,8 @@ drives:
 agent:
   temperament: equilibrado      # key into temperaments
   history: 0                    # the agent lives in one history (all its parallel bodies)
-  infancy: runs/20261116-152329_fase2a/checkpoints/update_0098000.pt  # common childhood (Phase 2a)
+  infancy: runs/20261116-152329_fase2a/checkpoints/update_0098000.pt  # common childhood, part 1 (Phase 2a); also the prediction-check baseline
+  start: null                   # common childhood, part 2: common_start.pt of experiment=common_feeding (null = new actor and critic)
   width: 128                    # actor and critic MLP width
   init_log_std: -0.5
 
@@ -206,6 +207,16 @@ ppo:
   ent_coef: 0.001               # keeps the policy from collapsing into stillness
   grad_clip: 0.5
 
+feeding:                        # experiment=common_feeding: common childhood part 2, learning to eat (hunger only, the 4 histories mixed)
+  eval_from: null               # first criterion evaluation (iteration; null = end of the protected-childhood ramp)
+  eval_every: 100               # then every this many iterations (multiple of life.log_every)
+  eval_envs_per_history: 8
+  eval_steps: 4096              # one whole episode, full cost, full initial energy, stochastic policy
+  max_below_01: 0.02            # criterion, in every history: fraction of steps below 0.1 < this ...
+  max_below_03: 0.10            # ... below 0.3 < this ...
+  min_food_per_1000: 1.0        # ... and food per 1000 steps >= this
+  max_hours: 2.0                # time cap: stop with status timeout
+
 ethics:                         # aversive signals at the minimum; see docs/protocolo.md
   low_energy: 0.1               # energy below this counts as "very low"
   max_low_fraction: 0.10        # more than this share of the life (after warm-up) at very low energy: stop
@@ -213,6 +224,7 @@ ethics:                         # aversive signals at the minimum; see docs/prot
 
 behavior:                       # pre-specified behaviour battery (seeds from BEHAVIOR_SEED_BASE)
   checkpoint: null              # agent checkpoint for experiment=behavior_battery
+  history: null                 # history of the battery (null = the agent's own; set it for common_start.pt)
   episodes: 8
   steps: 4000
   grid: 1.0                     # cell side for the covered area
@@ -226,6 +238,7 @@ behavior:                       # pre-specified behaviour battery (seeds from BE
 report:                         # experiment=agent_report: compare agents
   agents: []                    # list of agent run directories
   baseline: null                # infancy checkpoint for the prediction check (default: the agents' infancy)
+  start_behavior: null          # run folder of the battery on common_start.pt: the shared baseline of the character
 
 population:
   dir: runs/population          # fixed folder: population.json and one subfolder per agent

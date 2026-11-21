@@ -165,6 +165,54 @@ def run_live_agent(config: Config, recorder: Recorder, np_rng: np.random.Generat
                          f"[{v['ci95'][0]:.3f}, {v['ci95'][1]:.3f}]")
 
 
+@register("common_feeding")
+def run_common_feeding(config: Config, recorder: Recorder, np_rng: np.random.Generator,
+                       resume: Checkpoint | None) -> None:
+    """Common childhood, part 2: learning to eat (see ``umbral.mind.life``).
+
+    Leaves ``checkpoints/common_start.pt`` if the criterion is met, and
+    ``feeding_summary.json``: every criterion evaluation per history, and the actor's
+    ``log_std`` at its initialization and at the end (how much exploration the phase
+    took away), plus the ethics summary.
+    """
+    from umbral.mind.report import plot_feeding
+
+    life = Life(config, recorder, np_rng, resume, feeding=True)
+    summary = life.run()
+    d = recorder.run_dir
+    f = summary["feeding"]
+    init, final = np.array(f["log_std_init"]), np.array(f["log_std_final"])
+    out = {"status": summary["life_status"], "common_start": str(d / "checkpoints" / "common_start.pt")
+           if summary["life_status"] == "completed" else None,
+           "evals": f["evals"],
+           "log_std": {"init": init.tolist(), "final": final.tolist(), "init_mean": float(init.mean()),
+                       "final_mean": float(final.mean()), "std_init_mean": float(np.exp(init).mean()),
+                       "std_final_mean": float(np.exp(final).mean()),
+                       "std_ratio_final_over_init": float(np.exp(final).mean() / np.exp(init).mean())},
+           "ethics": {k: v for k, v in summary["ethics"].items() if k != "energy_curve"}}
+    (d / "feeding_summary.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+    if summary["life_status"] == "flagged":
+        (d / "flagged_summary.json").write_text(json.dumps(summary["ethics"], indent=2) + "\n", encoding="utf-8")
+        recorder.log(f"FLAGGED by the ethics rule: {summary['ethics']['fraction_below_0.1_after_warmup']:.3f} "
+                     f"of the phase below {config.ethics.low_energy} after warm-up")
+    recorder.log(f"feeding {summary['life_status']}: action std {out['log_std']['std_init_mean']:.3f} -> "
+                 f"{out['log_std']['std_final_mean']:.3f} (x{out['log_std']['std_ratio_final_over_init']:.2f})")
+    if f["evals"]:
+        plot_feeding(f["evals"], config, d / "feeding_criterion.png")
+
+
+def energy_zero_summary(beh: dict[str, list[float]] | None) -> dict[str, Any] | None:
+    """How many battery episodes reach energy 0, and how long they stay there."""
+    if not beh or "energy_zero" not in beh:
+        return None
+    z, run = np.array(beh["energy_zero"]), np.array(beh["energy_zero_run"])
+    hit = z > 0
+    return {"episodes": int(len(z)), "episodes_reaching_zero": int(hit.sum()),
+            "mean_fraction_at_zero": float(z.mean()),
+            "mean_fraction_at_zero_when_reached": float(z[hit].mean()) if hit.any() else 0.0,
+            "longest_run_steps": float(run.max()) if len(run) else 0.0}
+
+
 @register("behavior_battery")
 def run_behavior_battery(config: Config, recorder: Recorder, np_rng: np.random.Generator,
                          resume: Checkpoint | None) -> None:
@@ -172,9 +220,11 @@ def run_behavior_battery(config: Config, recorder: Recorder, np_rng: np.random.G
         raise ValueError("behavior.checkpoint must point to a live_agent checkpoint")
     ckpt = load_checkpoint(Path(str(config.behavior.checkpoint)))
     agent, acfg = load_agent(ckpt)
-    beh = run_battery(agent, config, str(acfg.agent.history))
+    history = str(acfg.agent.history if config.behavior.history is None else config.behavior.history)
+    beh = run_battery(agent, config, history)
     beh["checkpoint"] = str(config.behavior.checkpoint)
-    recorder.update_meta(temperament=str(acfg.agent.temperament), history=str(acfg.agent.history),
+    temperament = (ckpt.extra or {}).get("temperament") or str(acfg.agent.temperament)
+    recorder.update_meta(temperament=temperament, history=history,
                          agent_checkpoint=str(config.behavior.checkpoint), agent_step=ckpt.step)
     (recorder.run_dir / "behavior.json").write_text(json.dumps(beh, indent=2) + "\n", encoding="utf-8")
 
@@ -201,6 +251,19 @@ def run_agent_report(config: Config, recorder: Recorder, np_rng: np.random.Gener
     for key in ("behavior", "behavior_short"):
         with_beh = {k: v[key] for k, v in agents.items() if v[key]}
         report[key] = compare(with_beh, int(config.behavior.n_boot)) if with_beh else None
+    # The character's development: the shared starting point (one battery: before living, the policy
+    # does not depend on the temperament) against the end of the short and the long life.
+    start = None
+    if config.report.start_behavior:
+        start = json.loads((Path(str(config.report.start_behavior)) / "behavior.json").read_text(encoding="utf-8"))
+    report["start_behavior"] = start
+    report["development"] = {}
+    for name, info in agents.items():
+        stages = {k: v for k, v in (("start", start), ("short", info["behavior_short"]), ("long", info["behavior"]))
+                  if v}
+        report["development"][name] = compare(stages, int(config.behavior.n_boot)) if len(stages) > 1 else None
+    report["energy_zero"] = {"start": energy_zero_summary(start), **{
+        name: {k: energy_zero_summary(info[k]) for k in ("behavior_short", "behavior")} for name, info in agents.items()}}
     (recorder.run_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     for name, info in agents.items():
         for ph, v in (info["ethics"].get("phases") or {}).items():
@@ -228,4 +291,15 @@ def run_agent_report(config: Config, recorder: Recorder, np_rng: np.random.Gener
             for pair, v in comp["hedges_g"][m].items():
                 if v is not None:
                     recorder.log(f"g {m:<18} {pair:<60} {v['g']:+.2f} [{v['ci95'][0]}, {v['ci95'][1]}]")
+    for name, comp in report["development"].items():
+        if not comp:
+            continue
+        recorder.log(f"--- development {name}")
+        for m in ("effort", "distance", "area", "food", "neutral_contacts", "energy_mean"):
+            cells = "  ".join(f"{st} {v['mean']:.3g}" for st, v in comp["means"][m].items() if v)
+            gs = "  ".join(f"g {pair} {v['g']:+.2f} [{v['ci95'][0]}, {v['ci95'][1]}]"
+                           for pair, v in comp["hedges_g"][m].items() if v)
+            recorder.log(f"{m:<18} {cells}   {gs}")
+    for name, v in report["energy_zero"].items():
+        recorder.log(f"energy zero {name}: {v}")
     plot_agents(report, [Path(str(d)) for d in config.report.agents], recorder.run_dir)
