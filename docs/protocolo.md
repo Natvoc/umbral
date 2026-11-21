@@ -150,6 +150,11 @@ Métricas de tacto del modelo predictivo, definidas el 16 de noviembre de 2026, 
     1. El cauteloso se distingue del equilibrado en el esfuerzo medio de la batería (8 episodios por agente, en la iteración 900). Se juntan los 16 episodios de cada temperamento (2 semillas): la g de Hedges cauteloso frente a equilibrado debe ser negativa con su intervalo del 95 % entero bajo 0, y además negativa en cada semilla por separado.
     2. Ninguna vida dispara la regla ética.
     3. Ningún temperamento se paraliza: en las últimas 100 iteraciones (801–900), energía media ≥ 0,5 y comida ≥ 0,5 cada 1.000 pasos, en cada una de las 6 vidas.
+  - Resultado (19 y 21 de noviembre de 2026): **ninguna escala cumplió.** Las tres se descartaron por la condición 2, siempre al poco de terminar el calentamiento y en plena infancia protegida:
+    - Escala 25: el curioso (semilla 901) disparó la regla en la iteración 190 (11,9 % bajo 0,1 tras el calentamiento; energía media 0,49, percentil 10 de 0,05, esfuerzo 0,28–0,30).
+    - Escala 50: el equilibrado (semilla 900) la disparó en la iteración 250 (10,06 %; energía media 0,53, percentil 10 de 0,05, mínimo 0,00, esfuerzo 0,23–0,29, comida 0,2–1,2 cada 1.000 pasos). Las otras cuatro vidas que terminaron sus 900 iteraciones estaban sanas en las iteraciones 801–900: los curiosos con energía 0,77 y 0,81 y comida 2,5 y 3,7; los cautelosos con energía 0,75 y 0,78 y comida 1,5 y 1,6. Todas tuvieron en ese tramo algún cuerpo con energía 0,00.
+    - Escala 100: el curioso (semilla 900) la disparó en la iteración 190 (10,75 %; energía media 0,59, percentil 10 de 0,08 en la iteración 180, esfuerzo 0,29–0,31).
+    - Las vidas que quedaban en cada escala descartada se detuvieron a propósito (`stopped`). La serie se detuvo y la decisión queda en manos de la investigadora.
   - Se elige la escala más pequeña que cumpla las tres. Si una vida dispara la regla, la serie de esa escala se detiene, la escala se descarta y se pasa a la siguiente. Si ninguna pasa, se detiene todo y se informa, sin probar otros ajustes.
 - Toda pérdida es reversible: el cuerpo se restituye al final de cada condición.
 - Periodos sin cuerpo acotados y definidos de antemano.
