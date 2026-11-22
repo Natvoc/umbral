@@ -13,5 +13,6 @@ from umbral.experiments import random_agent as _random_agent  # noqa: F401  (reg
 from umbral.experiments import world_model as _world_model  # noqa: F401  (Phase 2a experiments)
 from umbral.experiments import agent as _agent  # noqa: F401  (Phase 2b experiments)
 from umbral.experiments import population as _population  # noqa: F401  (registers "train_population")
+from umbral.experiments import diagnosis as _diagnosis  # noqa: F401  (registers "zero_diagnosis")
 
 __all__ = ["available", "get_experiment", "register"]

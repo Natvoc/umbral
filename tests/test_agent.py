@@ -694,3 +694,22 @@ def test_the_battery_marks_episodes_for_review(tmp_path, infancy):
     cfg = life_config(tmp_path, infancy, "ethics.zero_run_limit=200")
     assert battery_review({"energy_zero_run": [0.0, 199.0, 200.0, 1404.0]}, cfg) == [2, 3]
     assert battery_review({"energy_zero_run": [1404.0]}, life_config(tmp_path, infancy, "ethics.zero_run_limit=null")) == []
+
+
+def test_zero_diagnosis_reports_the_drives_at_energy_zero(tmp_path, infancy):
+    # A short life whose bodies start with no energy; then the diagnosis from its checkpoint.
+    life = run_experiment(life_config(tmp_path, infancy, "run.name=zdiag_life", "life.run_report=false",
+                                      "body.energy.initial=0.0", "ethics.zero_run_limit=null",
+                                      "ethics.max_low_fraction=1.0", "life.stop_at=2"))
+    ck = life / "checkpoints" / "iter_0000002.pt"
+    d = run_experiment(life_config(tmp_path, infancy, "experiment=zero_diagnosis", f"diagnosis.checkpoint={ck.as_posix()}",
+                                   "diagnosis.steps=40", "ethics.zero_run_limit=5", "run.name=zdiag"))
+    r = json.loads((d / "diagnosis.json").read_text(encoding="utf-8"))
+    z = r["bands"]["zero"]
+    assert z["steps"] > 0 and z["hunger"] == 0.0 and z["curiosity"] == 0.0 and z["gate"] == 0.0  # no drive but caution
+    assert z["caution"] <= 0.0 and z["total"] == z["caution"]
+    assert "infancy" in r["training_exposure"] and isinstance(r["zero_stretches"], list)
+    again = run_experiment(life_config(tmp_path, infancy, "experiment=zero_diagnosis", f"diagnosis.checkpoint={ck.as_posix()}",
+                                       "diagnosis.steps=40", "ethics.zero_run_limit=5", "run.name=zdiag2"))
+    assert (again / "diagnosis.json").read_text(encoding="utf-8").replace(str(again), "") == \
+        (d / "diagnosis.json").read_text(encoding="utf-8").replace(str(d), "")  # deterministic from the checkpoint
