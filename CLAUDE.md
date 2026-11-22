@@ -66,6 +66,7 @@ Umbral estudia agentes pequeños entrenados desde cero en un mundo 2D: cómo des
 - Fase 2a (modelo predictivo): equivalencia del lote probada y rendimiento registrado; reanudar y clonar con el mundo probado; una corrida completa de `train_world_model`; en la evaluación, el modelo supera claramente a la persistencia en todos los canales, y al modelo sin copia eferente al menos en propiocepción y tacto; todos los tests pasan.
 - Fase 2b (impulsos y temperamentos): intervalos de confianza de la 2a en el README; en el piloto (3 temperamentos × abundancia × 1 semilla), los temperamentos se distinguen en la batería de comportamiento (con tamaños de efecto e intervalos), los agentes comen y respetan la regla ética, y el error de predicción no empeora respecto de la 2a; `train_population` listo y probado, sin lanzar.
 - Las corridas largas (de horas) no se lanzan sin el visto bueno de la investigadora.
+- **Las corridas largas (piloto, población) se lanzan desde una terminal de PowerShell externa**, abierta por la investigadora, fuera de la sesión de Claude Code, para que no las corte el mecanismo que mata procesos en segundo plano cuando falta memoria. Claude prepara el comando exacto (con `.venv\Scripts\python.exe` y la reanudación de la carpeta de la población), dice qué archivo mirar para saber si terminó o se detuvo, y lee los resultados cuando la investigadora avisa.
 - En esta laptop, `umbral.exe` está bloqueado por Smart App Control: se usa `python -m umbral ...`, que es equivalente.
 
 ## Estructura
