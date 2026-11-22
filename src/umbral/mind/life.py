@@ -108,7 +108,6 @@ FEEDING_EVAL_SEED_BASE = EVAL_SEED_BASE + 4_000_000  # its termination criterion
 
 
 RAMP_BINS = 1000  # energy histogram resolution of the competence window (0.001)
-ZERO_RUN_THRESHOLDS = (200, 500, 1000)  # steps in a row at energy 0, counted body by body
 
 
 def competent(window: list[dict[str, Any]], size: int, max_low: float, min_p10: float) -> bool:
@@ -581,8 +580,11 @@ class Life:
         """Stretches of consecutive steps at energy exactly 0, body by body (``ethics``, checkpointed).
 
         A stretch ends when the body's energy leaves 0 or its episode restarts. Kept: the
-        longest, the count of stretches of at least ZERO_RUN_THRESHOLDS steps (also per phase
-        and after warm-up), and each body slot's longest. Logged every iteration as
+        longest, the count of stretches of at least ``ethics.zero_run_thresholds`` steps (also
+        per phase and after warm-up), and each body slot's longest. Individual rule, observation
+        only: for each threshold, the first iteration (after warm-up) at which a body's open
+        stretch reached it, i.e. when that rule would have stopped the life. It stops nothing.
+        Logged every iteration as
         ``energy_zero_run_max`` (the longest open or closed stretch of this iteration).
         """
         ex = self.ethics
@@ -590,12 +592,13 @@ class Life:
         slot_max = np.asarray(ex.get("zero_slot_max", [0] * self.N), dtype=int)
         checked = it > self.iterations * float(self.config.ethics.warmup_fraction)
         it_max = 0
+        thresholds = [int(x) for x in self.config.ethics.zero_run_thresholds]
 
         def close(lengths: np.ndarray) -> None:
             for L in lengths.tolist():
                 ex["zero_runs"] = ex.get("zero_runs", 0) + 1
                 ex["zero_run_longest"] = max(int(ex.get("zero_run_longest", 0)), int(L))
-                for thr in ZERO_RUN_THRESHOLDS:
+                for thr in thresholds:
                     if L >= thr:
                         for key in (f"zero_runs_ge{thr}", f"zero_runs_ge{thr}_{phase}",
                                     *([f"zero_runs_ge{thr}_checked"] if checked else [])):
@@ -607,6 +610,10 @@ class Life:
             cur = np.where(z, cur + 1, 0)
             slot_max = np.maximum(slot_max, cur)
             it_max = max(it_max, int(cur.max()))
+        if checked:
+            for thr in thresholds:
+                if it_max >= thr and ex.get(f"zero_would_flag_{thr}") is None:
+                    ex[f"zero_would_flag_{thr}"] = it
         ending = self.life_left == 0  # these bodies restart at the next iteration
         close(cur[ending & (cur > 0)])
         cur[ending] = 0
@@ -645,7 +652,9 @@ class Life:
             "stretches": int(e.get("zero_runs", 0)) + len(open_),
             "longest": max(int(e.get("zero_run_longest", 0)), int(open_.max()) if len(open_) else 0),
             "slot_longest": [int(x) for x in e.get("zero_slot_max", [0] * self.N)]}
-        for thr in ZERO_RUN_THRESHOLDS:
+        out["would_flag_at_iteration"] = {}  # observation only: the individual rule never stops a life
+        for thr in [int(x) for x in self.config.ethics.zero_run_thresholds]:
+            out["would_flag_at_iteration"][str(thr)] = e.get(f"zero_would_flag_{thr}")
             extra = int((open_ >= thr).sum())
             out[f"ge{thr}"] = int(e.get(f"zero_runs_ge{thr}", 0)) + extra
             out[f"ge{thr}_after_warmup"] = int(e.get(f"zero_runs_ge{thr}_checked", 0)) + extra

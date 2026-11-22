@@ -443,6 +443,9 @@ def run_agent_report(config: Config, recorder: Recorder, np_rng: np.random.Gener
             recorder.log(f"{name} energy-0 stretches per body: longest {z['longest']} steps, "
                          + "  ".join(f">={t}: {z[f'ge{t}']} ({z[f'ge{t}_after_warmup']} after warm-up)"
                                      for t in (200, 500, 1000)))
+            recorder.log(f"{name} individual rule (observation only, stops nothing): " + "  ".join(
+                f">={t} steps: " + (f"would have stopped the life at iteration {v}" if v is not None else "would not stop")
+                for t, v in z.get("would_flag_at_iteration", {}).items()))
         for ph, v in info["drive_shares"].items():
             if v:
                 recorder.log(f"{name} {ph} drive shares: " + "  ".join(

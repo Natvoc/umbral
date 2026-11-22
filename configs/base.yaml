@@ -169,7 +169,7 @@ drives:
   hunger_scale: 100.0          # 10 until 17 Nov: the agent learned to stay still instead of eating
   curiosity_scale: 0.03         # curiosity = world-facing prediction error / its running mean
   curiosity_ema: 0.01           # rate of that running mean (per rollout)
-  caution_scale: 100.0          # caution = -caution_scale * effort_cost * mean(a_t^2)
+  caution_scale: 25.0           # caution = -caution_scale * effort_cost * mean(a_t^2); 25 = calibrated (calib5, 21 Nov 2026)
   gate_low: 0.2                 # hunger gate g(E) = clip((E - gate_low) / (set_point - gate_low), 0, 1) multiplies curiosity only (caution is the brake)
 
 agent:
@@ -228,6 +228,9 @@ ethics:                         # aversive signals at the minimum; see docs/prot
   low_energy: 0.1               # energy below this counts as "very low"
   max_low_fraction: 0.10        # more than this share of the life (after warm-up) at very low energy: stop
   warmup_fraction: 0.05         # share of the life before the check starts
+  zero_run_thresholds: [200, 500, 1000]  # individual rule (22 Nov 2026), OBSERVATION ONLY: steps in a row at energy 0
+                                #   of one body after warm-up; reported (would it have stopped the life, and when),
+                                #   never stops anything until the researcher fixes the threshold
 
 behavior:                       # pre-specified behaviour battery (seeds from BEHAVIOR_SEED_BASE)
   checkpoint: null              # agent checkpoint for experiment=behavior_battery

@@ -575,6 +575,29 @@ def test_energy_zero_stretches_are_counted_body_by_body(tmp_path, infancy):
         assert life.acc["energy_zero_run_max"] == 16 + 9
 
 
+def test_the_individual_rule_only_observes(tmp_path, infancy):
+    from umbral.mind.life import Life
+    from umbral.recorder import Recorder
+
+    cfg = life_config(tmp_path, infancy, "run.name=zobs", "ethics.zero_run_thresholds=[3,10]")
+    with Recorder(cfg) as rec:
+        life = Life(cfg, rec, np.random.default_rng(0), None)
+        life._reset_acc()
+        life.life_left[:] = 3
+        e = np.full((4, 16), 0.5)
+        e[0, 4:9] = 0.0  # 5 steps: >= 3, < 10
+        life._update_zero_runs(it=0, e=e, phase="infancy")  # warm-up: observed but not a "would stop"
+        assert life.zero_run_summary()["would_flag_at_iteration"] == {"3": None, "10": None}
+        life._update_zero_runs(it=5, e=e, phase="infancy")
+        z = life.zero_run_summary()
+        assert z["would_flag_at_iteration"] == {"3": 5, "10": None} and z["ge3"] == 2 and z["ge3_after_warmup"] == 1
+    d = run_experiment(life_config(tmp_path, infancy, "run.name=zobs2", "life.run_report=false",
+                                   "ethics.zero_run_thresholds=[1]", "body.energy.initial=0.0"))
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    assert meta["life_status"] != "flagged" or meta["ethics"]["fraction_below_0.1_after_warmup"] > 0.10
+    assert "would_flag_at_iteration" in meta["ethics"]["zero_runs"]  # computed, reported, stops nothing
+
+
 def test_recording_a_battery_does_not_change_it(tmp_path, infancy, common_start):
     from umbral.metrics.behavior import run_battery
 

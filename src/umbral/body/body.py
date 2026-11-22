@@ -28,6 +28,11 @@ Rules:
 - Limbs only sense obstacles, but may not cross walls: a joint move that would put
   a limb point outside the arena is reverted; if the limb is outside even with its
   previous angles (trunk moved too close to a wall), the trunk move is reverted.
+- A reverted trunk move reverts only the translation: the body still turns in place,
+  unless the new heading would put a limb outside the arena with both its new and its
+  previous angles (then the turn is reverted too). Since 22 Nov 2026: before, the turn
+  was always reverted with the translation, and bodies stayed wedged for over 1,000
+  steps repeating the same blocked action (docs/protocolo.md).
 - Energy: ``E' = clip(E - basal - effort_cost * effort + food_value * n_eaten, 0, 1)``
   with ``effort = mean(executed ** 2)``. Energy 0 means weaker, slower movement,
   never death.
@@ -188,14 +193,19 @@ def move_body_b(p: BodyParams, size: float, pos: np.ndarray, heading: np.ndarray
     ok_new = _limbs_inside_b(p, size, pos_new, h_new, q_new)
     ok_old = _limbs_inside_b(p, size, pos_new, h_new, q)
     trunk_ok = _trunk_clear_b(p, size, pos_new, obs_pos, obs_r) & (ok_new | ok_old).all(axis=-1)
+    # translation reverted: turn in place if the new heading keeps every limb inside
+    ok_turn_new = _limbs_inside_b(p, size, pos, h_new, q_new)
+    ok_turn_old = _limbs_inside_b(p, size, pos, h_new, q)
+    turn_ok = ~trunk_ok & (ok_turn_new | ok_turn_old).all(axis=-1)
     ok_reverted = _limbs_inside_b(p, size, pos, heading, q_new)
 
     q_keep = np.where(ok_new[..., None], q_new, q)
+    q_turn = np.where(ok_turn_new[..., None], q_new, q)
     q_rev = np.where(ok_reverted[..., None], q_new, q)
-    q_out = np.where(trunk_ok[:, None, None], q_keep, q_rev)
+    q_out = np.where(trunk_ok[:, None, None], q_keep, np.where(turn_ok[:, None, None], q_turn, q_rev))
     return {
         "pos": np.where(trunk_ok[:, None], pos_new, pos),
-        "heading": wrap_angle(np.where(trunk_ok, h_new, heading)),
+        "heading": wrap_angle(np.where(trunk_ok | turn_ok, h_new, heading)),
         "q": q_out,
         "dq": q_out - q,
         "neutral_pos": np.where(trunk_ok[:, None, None], neu_new, neu_pos),
