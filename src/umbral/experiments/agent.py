@@ -170,6 +170,11 @@ def run_live_agent(config: Config, recorder: Recorder, np_rng: np.random.Generat
         for c, v in pc["channels"].items():
             recorder.log(f"prediction {c}: agent/childhood {v['ratio']:.3f} "
                          f"[{v['ci95'][0]:.3f}, {v['ci95'][1]:.3f}]")
+        own = prediction_check(agent.world, config.agent.infancy, config, agent=agent)  # own behaviour (22 Nov)
+        (d / "prediction_own.json").write_text(json.dumps(own, indent=2) + "\n", encoding="utf-8")
+        for c, v in own["channels"].items():
+            recorder.log(f"prediction on own behaviour {c}: agent/childhood {v['ratio']:.3f} "
+                         f"[{v['ci95'][0]:.3f}, {v['ci95'][1]:.3f}]")
 
 
 @register("common_feeding")

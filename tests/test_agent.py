@@ -475,7 +475,10 @@ def test_life_report_writes_behavior_and_prediction_check(tmp_path, infancy):
         assert 0.0 <= z <= low and 0 <= run <= z * 60 + 1e-9
     pc = json.loads((d / "prediction_check.json").read_text(encoding="utf-8"))
     assert set(pc["channels"]) == {"proprio", "touch", "vision", "intero"}
+    own = json.loads((d / "prediction_own.json").read_text(encoding="utf-8"))  # on the agent's own behaviour
+    assert own["behaviour"] == "own" and set(own["channels"]) == set(pc["channels"])
     meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    assert "would_flag_at_iteration" in meta["ethics"]["zero_runs"]
     assert meta["life_status"] == "completed" and "fraction_below_0.1" in meta["ethics"]
     short = json.loads((d / "behavior_short.json").read_text(encoding="utf-8"))
     assert short["checkpoint"].endswith("life_short.pt") and len(short["effort"]) == 2
