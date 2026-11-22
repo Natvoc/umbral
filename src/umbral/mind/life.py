@@ -108,6 +108,7 @@ FEEDING_EVAL_SEED_BASE = EVAL_SEED_BASE + 4_000_000  # its termination criterion
 
 
 RAMP_BINS = 1000  # energy histogram resolution of the competence window (0.001)
+ZERO_RUN_THRESHOLDS = (200, 500, 1000)  # steps in a row at energy 0, counted body by body
 
 
 def competent(window: list[dict[str, Any]], size: int, max_low: float, min_p10: float) -> bool:
@@ -551,6 +552,7 @@ class Life:
         self.ethics["below_03"] += int((e < 0.3).sum())
         self.ethics["food"] += int(r["food"].sum())
         self.ethics["energy_sum"] += float(e.sum())
+        self._update_zero_runs(it, e, phase)
         if it > self.iterations * float(self.config.ethics.warmup_fraction):
             self.ethics["steps_checked"] = self.ethics.get("steps_checked", 0) + e.size
             self.ethics["low_checked"] = self.ethics.get("low_checked", 0) + int(
@@ -575,6 +577,42 @@ class Life:
         self.acc_n += 1
         self.times["io"] += time.perf_counter() - t2
 
+    def _update_zero_runs(self, it: int, e: np.ndarray, phase: str) -> None:
+        """Stretches of consecutive steps at energy exactly 0, body by body (``ethics``, checkpointed).
+
+        A stretch ends when the body's energy leaves 0 or its episode restarts. Kept: the
+        longest, the count of stretches of at least ZERO_RUN_THRESHOLDS steps (also per phase
+        and after warm-up), and each body slot's longest. Logged every iteration as
+        ``energy_zero_run_max`` (the longest open or closed stretch of this iteration).
+        """
+        ex = self.ethics
+        cur = np.asarray(ex.get("zero_cur", [0] * self.N), dtype=int)
+        slot_max = np.asarray(ex.get("zero_slot_max", [0] * self.N), dtype=int)
+        checked = it > self.iterations * float(self.config.ethics.warmup_fraction)
+        it_max = 0
+
+        def close(lengths: np.ndarray) -> None:
+            for L in lengths.tolist():
+                ex["zero_runs"] = ex.get("zero_runs", 0) + 1
+                ex["zero_run_longest"] = max(int(ex.get("zero_run_longest", 0)), int(L))
+                for thr in ZERO_RUN_THRESHOLDS:
+                    if L >= thr:
+                        for key in (f"zero_runs_ge{thr}", f"zero_runs_ge{thr}_{phase}",
+                                    *([f"zero_runs_ge{thr}_checked"] if checked else [])):
+                            ex[key] = ex.get(key, 0) + 1
+
+        for t in range(e.shape[1]):
+            z = e[:, t] == 0.0
+            close(cur[~z & (cur > 0)])
+            cur = np.where(z, cur + 1, 0)
+            slot_max = np.maximum(slot_max, cur)
+            it_max = max(it_max, int(cur.max()))
+        ending = self.life_left == 0  # these bodies restart at the next iteration
+        close(cur[ending & (cur > 0)])
+        cur[ending] = 0
+        ex["zero_cur"], ex["zero_slot_max"] = cur.tolist(), slot_max.tolist()
+        self._add("energy_zero_run_max", it_max)
+
     def _log(self, it: int) -> None:
         for k, v in self.acc.items():
             self.rec.log_metric(it, k, v / self.acc_n)
@@ -598,6 +636,24 @@ class Life:
             mind_state={"h": self.h, "prev_action": torch.as_tensor(self.prev_action)})
         return save_checkpoint(self.rec.run_dir / "checkpoints" / f"{name}.pt", ckpt)
 
+    def zero_run_summary(self) -> dict[str, Any]:
+        """Stretches at energy 0 per body (open stretches at the end of the life included)."""
+        e = self.ethics
+        cur = np.asarray(e.get("zero_cur", [0] * self.N), dtype=int)
+        open_ = cur[cur > 0]
+        out: dict[str, Any] = {
+            "stretches": int(e.get("zero_runs", 0)) + len(open_),
+            "longest": max(int(e.get("zero_run_longest", 0)), int(open_.max()) if len(open_) else 0),
+            "slot_longest": [int(x) for x in e.get("zero_slot_max", [0] * self.N)]}
+        for thr in ZERO_RUN_THRESHOLDS:
+            extra = int((open_ >= thr).sum())
+            out[f"ge{thr}"] = int(e.get(f"zero_runs_ge{thr}", 0)) + extra
+            out[f"ge{thr}_after_warmup"] = int(e.get(f"zero_runs_ge{thr}_checked", 0)) + extra
+            for ph in ("infancy", "adult"):
+                out[f"ge{thr}_{ph}"] = int(e.get(f"zero_runs_ge{thr}_{ph}", 0))
+            out[f"slots_ge{thr}"] = int((np.asarray(out["slot_longest"]) >= thr).sum())
+        return out
+
     def ethics_summary(self) -> dict[str, Any]:
         e = self.ethics
         steps = max(e["steps"], 1)
@@ -614,6 +670,7 @@ class Life:
                                 "energy_min": e.get(f"min_{ph}"),
                                 "energy_p10": _hist_quantile(e.get(f"hist_{ph}"), 0.10)}
                            for ph in ("infancy", "adult")},
+                "zero_runs": self.zero_run_summary(),
                 "infancy_end_iteration": self.infancy_end,
                 "energy_curve": list(self.energy_curve),
                 "energy_curve_every_iterations": self.log_every}

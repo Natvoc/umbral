@@ -70,9 +70,36 @@ def channel_sq_error_rows(layout: ObsLayout, pred: torch.Tensor, target: torch.T
     return out
 
 
+class AgentActor:
+    """An agent's own stochastic policy as the behaviour of an evaluation.
+
+    It keeps its own hidden state (the agent's mind stepped on what it perceives) and its
+    own noise generators (``GaussianNoise`` on ``policy_seeds``). ``act(obs, prev)`` takes
+    the current flat observation and the previous intended action.
+    """
+
+    def __init__(self, agent, n: int, policy_seeds: list[int]):
+        from umbral.mind.agent import GaussianNoise
+
+        self.agent = agent
+        self.noise = GaussianNoise(n, list(policy_seeds))
+        self.h = agent.world.initial_state(n)
+
+    @torch.no_grad()
+    def act(self, obs: np.ndarray, prev: np.ndarray) -> np.ndarray:
+        w = self.agent.world
+        self.h = w.step_hidden(torch.as_tensor(obs, dtype=torch.float32), torch.as_tensor(prev, dtype=torch.float32),
+                               self.h)
+        a, *_ = self.agent.act(self.h[0], self.noise.sample())
+        return a
+
+
 def evaluate(models: Mapping[str, WorldModel], config: Config, histories: list[str], seeds: list[int],
-             policy_seeds: list[int], steps: int, chunk: int) -> dict:
+             policy_seeds: list[int], steps: int, chunk: int, actor: AgentActor | None = None) -> dict:
     """Run the OU policy on fixed seeds; accumulate errors of each model and of persistence.
+
+    With ``actor`` (``AgentActor``), the behaviour is that agent's own policy instead of
+    the OU policy (``policy_seeds`` then seed the actor's noise); everything else is equal.
 
     Returns ``{"mse": {pred: {history: {channel: [sum, n]}}}, "touch": {pred: {event: [sum, n]}},
     "rows": {...}}``. ``rows`` keeps the same sums per environment (one evaluation seed each):
@@ -84,7 +111,7 @@ def evaluate(models: Mapping[str, WorldModel], config: Config, histories: list[s
     env = BatchedUmbralEnv(config, n, histories)
     env.reset(seed=list(seeds))
     tc = config.train
-    policy = OUPolicy(n, float(tc.smoothing), float(tc.scale), list(policy_seeds))
+    policy = OUPolicy(n, float(tc.smoothing), float(tc.scale), list(policy_seeds)) if actor is None else None
     h = {k: m.initial_state(n) for k, m in models.items()}
     prev_action = np.zeros((n, 6))
     predictors = (*models, "persistence")
@@ -98,7 +125,7 @@ def evaluate(models: Mapping[str, WorldModel], config: Config, histories: list[s
         prev = np.empty((n, T, 6))
         obs[:, 0] = env.observation()["flat"]
         for t in range(T):
-            o, _, _, _, info = env.step(policy.act())
+            o, _, _, _, info = env.step(policy.act() if actor is None else actor.act(obs[:, t], prev_action))
             prev[:, t], act[:, t] = prev_action, info["action_intended"]
             obs[:, t + 1] = o["flat"]
             prev_action = info["action_intended"]

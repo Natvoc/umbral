@@ -28,7 +28,7 @@ from umbral.config import Config
 from umbral.experiments.registry import register
 from umbral.metrics.behavior import MEASURES, compare, run_battery
 from umbral.mind.agent import Agent, build_agent
-from umbral.mind.evaluation import bootstrap_ratio_ci, evaluate
+from umbral.mind.evaluation import AgentActor, bootstrap_ratio_ci, evaluate
 from umbral.mind.life import COMPONENTS, Life
 from umbral.mind.model import CHANNELS, build_model
 from umbral.mind.training import EVAL_SEED_BASE, POLICY_SEED_OFFSET
@@ -104,12 +104,14 @@ def drive_shares(run_dir: Path, infancy_end: int) -> dict[str, Any]:
     return out
 
 
-def prediction_check(world, baseline_path: str | Path, config: Config) -> dict[str, Any]:
+def prediction_check(world, baseline_path: str | Path, config: Config, agent: Agent | None = None) -> dict[str, Any]:
     """The agent's self-model vs the childhood model, Phase 2a protocol (OU policy, eval seeds).
 
     Both are evaluated on the same environments, in the *current* world physics, so the
     baseline is always measured in the same world as the agent. Ratio agent / childhood
     per channel with a 95 % bootstrap CI over seeds (stratified by history).
+    With ``agent``, the data come from that agent's own stochastic policy instead of the
+    OU policy (same seeds; ``prediction_own``): both minds predict the agent's own life.
     """
     base = load_checkpoint(Path(str(baseline_path)))
     bcfg = Config(base.config)
@@ -121,16 +123,21 @@ def prediction_check(world, baseline_path: str | Path, config: Config) -> dict[s
     histories = [h for h in hids for _ in range(int(ec.envs_per_history))]
     n = len(histories)
     world.eval()
+    pseeds = [EVAL_SEED_BASE + POLICY_SEED_OFFSET + i for i in range(n)]
+    actor = None if agent is None else AgentActor(agent, n, pseeds)
     sums = evaluate({"agent": world, "childhood": w0}, config, histories, [EVAL_SEED_BASE + i for i in range(n)],
-                    [EVAL_SEED_BASE + POLICY_SEED_OFFSET + i for i in range(n)], int(ec.steps), int(ec.chunk))
+                    pseeds, int(ec.steps), int(ec.chunk), actor=actor)
     rows = sums["rows"]
-    out: dict[str, Any] = {"baseline": str(baseline_path), "envs": n, "steps": int(ec.steps), "channels": {}}
+    out: dict[str, Any] = {"baseline": str(baseline_path), "envs": n, "steps": int(ec.steps),
+                           "behaviour": "ou" if agent is None else "own", "channels": {}}
     for c in CHANNELS:
         a, b = rows["mse"]["agent"][c], rows["mse"]["childhood"][c]
         ma, mb = a[:, 0].sum() / a[:, 1].sum(), b[:, 0].sum() / b[:, 1].sum()
         lo, hi = bootstrap_ratio_ci(a, b, histories, int(ec.n_boot), int(ec.bootstrap_seed))
         out["channels"][c] = {"agent": float(ma), "childhood": float(mb), "ratio": float(ma / mb),
                               "ci95": [lo, hi]}
+        out["channels"][c]["by_history"] = {
+            hid: float(sums["mse"]["agent"][hid][c][0] / sums["mse"]["childhood"][hid][c][0]) for hid in hids}
     return out
 
 
@@ -217,6 +224,34 @@ def energy_zero_summary(beh: dict[str, list[float]] | None) -> dict[str, Any] | 
             "longest_run_steps": float(run.max()) if len(run) else 0.0}
 
 
+@register("prediction_own")
+def run_prediction_own(config: Config, recorder: Recorder, np_rng: np.random.Generator,
+                       resume: Checkpoint | None) -> None:
+    """Prediction error on the agent's own behaviour, besides the Phase 2a protocol (informative).
+
+    For every checkpoint in ``prediction.checkpoints``: the agent's mind and the childhood
+    model (``agent.infancy``) predict (a) the OU policy of Phase 2a and (b) the agent's own
+    stochastic policy, on the same evaluation seeds and the 4 histories. Ratio agent /
+    childhood per channel with 95 % CIs, per history, and the agent's own-vs-OU error.
+    Writes ``prediction_own.json``. It changes no criterion.
+    """
+    out: dict[str, Any] = {"baseline": str(config.agent.infancy), "checkpoints": {}}
+    for path in [str(p) for p in config.prediction.checkpoints]:
+        agent, _ = load_agent(load_checkpoint(Path(path)))
+        res = {"ou": prediction_check(agent.world, config.agent.infancy, config),
+               "own": prediction_check(agent.world, config.agent.infancy, config, agent=agent)}
+        res["agent_own_over_ou"] = {c: res["own"]["channels"][c]["agent"] / res["ou"]["channels"][c]["agent"]
+                                    for c in CHANNELS}
+        res["childhood_own_over_ou"] = {c: res["own"]["channels"][c]["childhood"]
+                                        / res["ou"]["channels"][c]["childhood"] for c in CHANNELS}
+        out["checkpoints"][path] = res
+        for b in ("ou", "own"):
+            recorder.log(f"{path} [{b}] " + "  ".join(
+                f"{c} {v['ratio']:.2f} [{v['ci95'][0]:.2f}, {v['ci95'][1]:.2f}]"
+                for c, v in res[b]["channels"].items()))
+        (recorder.run_dir / "prediction_own.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+
+
 @register("start_robustness")
 def run_start_robustness(config: Config, recorder: Recorder, np_rng: np.random.Generator,
                          resume: Checkpoint | None) -> None:
@@ -243,6 +278,104 @@ def run_start_robustness(config: Config, recorder: Recorder, np_rng: np.random.G
         recorder.log(f"offset {off}: {'passed' if ev['passed'] else 'not passed'}")
     recorder.update_meta(agent_checkpoint=str(config.agent.start), agent_step=ckpt.step)
     (recorder.run_dir / "robustness.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+
+
+def zero_runs(e: np.ndarray) -> list[tuple[int, int]]:
+    """(start, end) of every stretch with energy exactly 0 (end exclusive)."""
+    z = np.r_[False, e == 0.0, False]
+    d = np.diff(z.astype(int))
+    return list(zip(np.flatnonzero(d == 1).tolist(), np.flatnonzero(d == -1).tolist()))
+
+
+def analyze_zero_episode(sig: dict[str, np.ndarray], low: float = 0.1) -> dict[str, Any]:
+    """What happens in a recorded battery episode around its longest stretch at energy 0."""
+    e = sig["energy"].astype(float)
+    runs = zero_runs(e)
+    T = len(e)
+    pos = sig["trunk_pose"][:, :2].astype(float)
+    speed = np.r_[0.0, np.sqrt((np.diff(pos, axis=0) ** 2).sum(-1))]
+    effort = (sig["action_executed"].astype(float) ** 2).mean(-1)
+    intended = np.abs(sig["action_intended"].astype(float)).mean(-1)
+    mean_mag = np.abs(sig["action_mean"].astype(float)).mean(-1)
+    fp, fa = sig["food_pos"].astype(float), sig["food_active"].astype(bool)
+    dist = np.sqrt(((fp - pos[:, None]) ** 2).sum(-1))
+    nearest_food = np.where(fa.any(-1), np.where(fa, dist, np.inf).min(-1), np.nan)
+    size = float(sig["arena_size"])
+    wall = np.minimum(pos, size - pos).min(-1)
+    op, orr = sig["obstacle_pos"].astype(float), sig["obstacle_r"].astype(float)
+    obst = (np.sqrt(((op[None] - pos[:, None]) ** 2).sum(-1)) - orr[None]).min(-1) if len(orr) else np.full(T, np.nan)
+    touch = sig["raw_flat"]  # contact types from the touch rows
+    eaten = sig["food_eaten"].astype(float)
+
+    def seg(a: np.ndarray, s: int, t: int) -> float:
+        v = a[s:t]
+        v = v[np.isfinite(v)]
+        return float(v.mean()) if len(v) else float("nan")
+
+    out: dict[str, Any] = {"steps": T, "env_seed": int(sig["env_seed"]), "history": str(sig["history_id"]),
+                           "zero_runs": runs, "fraction_at_zero": float((e == 0).mean()),
+                           "longest_run": max((t - s for s, t in runs), default=0),
+                           "first_below_low": int(np.argmax(e < low)) if (e < low).any() else None,
+                           "food_total": float(eaten.sum())}
+    if not runs:
+        return out
+    s, t = max(runs, key=lambda x: x[1] - x[0])
+    pre = max(0, s - 500)
+    out["longest"] = {
+        "start": s, "end": t, "ends_by": "episode end" if t == T else ("food" if eaten[t - 1:t + 1].sum() > 0
+                                                                       else "energy rose"),
+        "displacement": float(np.linalg.norm(pos[t - 1] - pos[s])),
+        "path_length": float(speed[s:t].sum()),
+        "box": [float(np.ptp(pos[s:t, 0])), float(np.ptp(pos[s:t, 1]))],
+    }
+    for name, a in (("speed", speed), ("effort", effort), ("intended_abs", intended), ("policy_mean_abs", mean_mag),
+                    ("nearest_food", nearest_food), ("wall_distance", wall), ("obstacle_distance", obst),
+                    ("contacts", sig["contacts"].astype(float)), ("food_active", fa.sum(-1).astype(float))):
+        out["longest"][name] = {"before_500": seg(a, pre, s), "during": seg(a, s, t),
+                                "healthy": seg(np.where(e > 0.5, a, np.nan), 0, T)}
+    out["longest"]["food_eaten_during"] = float(eaten[s:t].sum())
+    out["longest"]["energy_before"] = [float(x) for x in e[max(0, s - 1000):s:100]]
+    return out
+
+
+@register("battery_replay")
+def run_battery_replay(config: Config, recorder: Recorder, np_rng: np.random.Generator,
+                       resume: Checkpoint | None) -> None:
+    """Battery episodes again, recorded step by step, with an analysis of their energy-0 stretches.
+
+    Same agent (``behavior.checkpoint``), history (``behavior.history``, default the
+    agent's) and seeds as the battery: the measures must match the battery's exactly
+    (``replay_matches`` in ``replay.json``). For every index in ``replay.episodes``:
+    ``signals_ep<i>.npz`` (the viewer's format: ``umbral.world.render.save_gif``),
+    ``ep<i>.gif`` around the longest stretch at energy 0, and its analysis.
+    """
+    from umbral.world.render import save_gif
+
+    ckpt = load_checkpoint(Path(str(config.behavior.checkpoint)))
+    agent, acfg = load_agent(ckpt)
+    history = str(acfg.agent.history if config.behavior.history is None else config.behavior.history)
+    eps = [int(i) for i in config.replay.episodes]
+    beh = run_battery(agent, config, history, record=eps)
+    recs = beh.pop("recordings")
+    ref_path = Path(str(config.behavior.checkpoint)).parent.parent
+    out: dict[str, Any] = {"checkpoint": str(config.behavior.checkpoint), "history": history, "episodes": {}}
+    for i in eps:
+        sig = recs[i]
+        np.savez_compressed(recorder.run_dir / f"signals_ep{i}.npz", **sig)
+        a = analyze_zero_episode(sig, float(config.ethics.low_energy))
+        a["battery"] = {k: v[i] for k, v in beh.items() if isinstance(v, list)}
+        out["episodes"][i] = a
+        if a.get("longest"):
+            s = a["longest"]["start"]
+            clip = {k: (v[max(0, s - 300):] if getattr(v, "ndim", 0) and len(v) == a["steps"] else v)
+                    for k, v in sig.items()}
+            save_gif(clip, recorder.run_dir / f"ep{i}.gif", steps=min(1200, a["steps"] - max(0, s - 300)), stride=6,
+                     fps=15, title=f"h{history} ep{i} · from step {max(0, s - 300)} ·")
+        recorder.log(f"episode {i}: at zero {a['fraction_at_zero']:.3f}, longest {a['longest_run']} steps, "
+                     f"runs {len(a['zero_runs'])}")
+    out["measures"] = beh
+    (recorder.run_dir / "replay.json").write_text(json.dumps(out, indent=2, default=float) + "\n", encoding="utf-8")
+    recorder.update_meta(agent_checkpoint=str(config.behavior.checkpoint), history=history, episodes=eps)
 
 
 @register("behavior_battery")
@@ -302,6 +435,14 @@ def run_agent_report(config: Config, recorder: Recorder, np_rng: np.random.Gener
             recorder.log(f"{name} {ph}: energy {v['mean_energy']:.3f}  below 0.1 {v['fraction_below_0.1']:.4f}  "
                          f"below 0.3 {v['fraction_below_0.3']:.4f}  food/1000 {v['food_per_1000_steps']:.2f}  "
                          f"min {v.get('energy_min')}  p10 {v.get('energy_p10')}")
+        recorder.log(f"{name} ethics rule: below 0.1 after warm-up "
+                     f"{info['ethics'].get('fraction_below_0.1_after_warmup', float('nan')):.4f} "
+                     f"(limit {float(config.ethics.max_low_fraction):.2f})")
+        z = info["ethics"].get("zero_runs")
+        if z:
+            recorder.log(f"{name} energy-0 stretches per body: longest {z['longest']} steps, "
+                         + "  ".join(f">={t}: {z[f'ge{t}']} ({z[f'ge{t}_after_warmup']} after warm-up)"
+                                     for t in (200, 500, 1000)))
         for ph, v in info["drive_shares"].items():
             if v:
                 recorder.log(f"{name} {ph} drive shares: " + "  ".join(

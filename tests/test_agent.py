@@ -207,7 +207,10 @@ def test_life_resume_reproduces_the_continuation(tmp_path, infancy):
     assert a.extra["drives"] == b.extra["drives"] and a.extra["scaler"] == b.extra["scaler"]
     assert set(a.optimizers) == {"world", "policy"}
     names = {json.loads(line)["name"] for line in read_metrics(full)}
-    assert {"ppo_approx_kl", "ppo_clip_fraction", "reward_curiosity", "energy_below_0.1"} <= names
+    assert {"ppo_approx_kl", "ppo_clip_fraction", "reward_curiosity", "energy_below_0.1",
+            "energy_zero_run_max"} <= names
+    assert a.extra["ethics"] == b.extra["ethics"]  # the energy-0 stretches per body included
+    assert "zero_cur" in a.extra["ethics"] and len(a.extra["ethics"]["zero_slot_max"]) == 4
 
 
 # --- the common childhood, part 2: learning to eat ------------------------------------------
@@ -540,3 +543,100 @@ def test_population_runs_resumes_and_skips_done_agents(tmp_path, infancy):
     assert second[b]["status"] == "done" and len(second[b]["runs"]) == 2
     meta = json.loads((__import__("pathlib").Path(second[b]["runs"][1]) / "meta.json").read_text(encoding="utf-8"))
     assert meta["resumed_at_step"] == 3
+
+
+# --- energy-0 stretches body by body, recorded battery, prediction on own behaviour ----------------
+
+def test_energy_zero_stretches_are_counted_body_by_body(tmp_path, infancy):
+    from umbral.mind.life import Life
+    from umbral.recorder import Recorder
+
+    cfg = life_config(tmp_path, infancy, "run.name=zr")
+    with Recorder(cfg) as rec:
+        life = Life(cfg, rec, np.random.default_rng(0), None)
+        life._reset_acc()
+        e = np.full((4, 16), 0.5)
+        e[0, 2:6] = 0.0     # a stretch of 4 that ends inside the iteration
+        e[1, 10:] = 0.0     # 6 steps, still open at the end of the iteration ...
+        e[2, :] = 0.0       # 16 steps, but its episode restarts: closed
+        e[3, 3] = 1e-9      # not exactly 0: no stretch
+        life.life_left[:] = [3, 3, 0, 3]
+        life._update_zero_runs(it=1, e=e, phase="infancy")
+        ex = life.ethics
+        assert ex["zero_cur"] == [0, 6, 0, 0] and ex["zero_slot_max"] == [4, 6, 16, 0]
+        assert ex["zero_runs"] == 2 and ex["zero_run_longest"] == 16
+        e2 = np.full((4, 16), 0.5)
+        e2[1, :3] = 0.0     # ... it continues: 6 + 3 = 9
+        life.life_left[:] = [2, 2, 3, 2]
+        life._update_zero_runs(it=2, e=e2, phase="infancy")
+        assert life.ethics["zero_slot_max"] == [4, 9, 16, 0] and life.ethics["zero_runs"] == 3
+        z = life.zero_run_summary()
+        assert z["longest"] == 16 and z["stretches"] == 3 and z["ge200"] == 0
+        assert life.acc["energy_zero_run_max"] == 16 + 9
+
+
+def test_recording_a_battery_does_not_change_it(tmp_path, infancy, common_start):
+    from umbral.metrics.behavior import run_battery
+
+    cfg = life_config(tmp_path, infancy)
+    agent, _ = load_agent(load_checkpoint(common_start / "checkpoints" / "common_start.pt"))
+    plain = run_battery(agent, cfg, "0")
+    recorded = run_battery(agent, cfg, "0", record=[1])
+    sig = recorded.pop("recordings")[1]
+    assert json.dumps(plain, sort_keys=True) == json.dumps(recorded, sort_keys=True)
+    T = int(cfg.behavior.steps)
+    assert sig["energy"].shape == (T,) and sig["trunk_pose"].shape == (T, 3) and sig["action_mean"].shape == (T, 6)
+    assert sig["neutral_pos"].shape[0] == T and sig["neutral_pos"].shape[1] == len(sig["neutral_r"])
+    assert np.isclose(sig["food_eaten"].sum(), plain["food"][1])
+
+
+def test_battery_replay_matches_the_battery_and_writes_viewer_signals(tmp_path, infancy, common_start):
+    from umbral.metrics.behavior import run_battery
+
+    path = common_start / "checkpoints" / "common_start.pt"
+    d = run_experiment(life_config(tmp_path, infancy, "experiment=battery_replay", f"behavior.checkpoint={path.as_posix()}",
+                                   "behavior.history=0", "replay.episodes=[0,1]", "run.name=replay"))
+    r = json.loads((d / "replay.json").read_text(encoding="utf-8"))
+    agent, _ = load_agent(load_checkpoint(path))
+    battery = run_battery(agent, life_config(tmp_path, infancy), "0")
+    assert r["measures"]["energy_zero"] == battery["energy_zero"] and r["measures"]["food"] == battery["food"]
+    for i in ("0", "1"):
+        assert r["episodes"][i]["battery"]["effort"] == battery["effort"][int(i)]
+        sig = np.load(d / f"signals_ep{i}.npz")
+        assert {"trunk_pose", "limb_points", "food_pos", "food_active", "neutral_pos", "arena_size"} <= set(sig.files)
+
+
+def test_zero_episode_analysis_on_a_synthetic_recording():
+    from umbral.experiments.agent import analyze_zero_episode, zero_runs
+
+    assert zero_runs(np.array([0.5, 0, 0, 0.1, 0, 0.2, 0, 0])) == [(1, 3), (4, 5), (6, 8)]
+    T = 10
+    e = np.array([0.4, 0.2, 0.0, 0.0, 0.0, 0.0, 0.3, 0.5, 0.6, 0.6])
+    sig = {"energy": e, "trunk_pose": np.c_[np.arange(T) * 0.1, np.zeros(T), np.zeros(T)],
+           "action_executed": np.full((T, 6), 0.3), "action_intended": np.full((T, 6), 1.0),
+           "action_mean": np.full((T, 6), 0.9), "food_pos": np.tile([[5.0, 0.0]], (T, 1, 1)),
+           "food_active": np.ones((T, 1), bool), "arena_size": np.float32(10), "obstacle_pos": np.zeros((0, 2)),
+           "obstacle_r": np.zeros(0), "raw_flat": np.zeros((T, 1)), "contacts": np.zeros(T),
+           "food_eaten": np.r_[np.zeros(6), 1, np.zeros(3)], "env_seed": np.int64(7), "history_id": np.array("2")}
+    a = analyze_zero_episode(sig)
+    assert a["longest_run"] == 4 and a["zero_runs"] == [(2, 6)] and a["first_below_low"] == 2
+    L = a["longest"]
+    assert L["start"] == 2 and L["end"] == 6 and L["ends_by"] == "food"
+    assert np.isclose(L["speed"]["during"], 0.1) and np.isclose(L["nearest_food"]["during"], 5 - 0.35)
+
+
+def test_evaluation_with_the_agents_own_policy(tmp_path, infancy, common_start):
+    path = common_start / "checkpoints" / "common_start.pt"
+    d = run_experiment(life_config(tmp_path, infancy, "experiment=prediction_own", f"prediction.checkpoints=[{path.as_posix()}]",
+                                   "eval.n_boot=50", "run.name=predown"))
+    r = json.loads((d / "prediction_own.json").read_text(encoding="utf-8"))["checkpoints"][path.as_posix()]
+    assert r["ou"]["behaviour"] == "ou" and r["own"]["behaviour"] == "own"
+    from umbral.experiments.agent import prediction_check
+
+    cfg = life_config(tmp_path, infancy, "eval.n_boot=50")
+    agent, _ = load_agent(load_checkpoint(path))
+    again = prediction_check(agent.world, cfg.agent.infancy, cfg, agent=agent)  # pure: same numbers again
+    for c, v in r["own"]["channels"].items():
+        assert v["agent"] == again["channels"][c]["agent"] and v["childhood"] == again["channels"][c]["childhood"]
+        assert v["agent"] != r["ou"]["channels"][c]["agent"]  # other data: the agent's own behaviour
+        assert set(v["by_history"]) == {"0", "1", "2", "3"}

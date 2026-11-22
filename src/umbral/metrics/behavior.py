@@ -39,7 +39,7 @@ temperament, this is variability *within* an individual, not between individuals
 from __future__ import annotations
 
 import itertools
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -72,10 +72,35 @@ def _probe_spot(env: BatchedUmbralEnv, r: int, distance: float, radius: float) -
     return None
 
 
+RECORD_KEYS = ("obs_flat", "raw_flat", "action_intended", "action_applied", "action_executed", "action_mean",
+               "energy", "fatigue", "food_eaten", "contacts", "basal", "effort_cost", "food_gain",
+               "trunk_pose", "limb_points", "food_pos", "food_active", "neutral_pos", "touch_intensity")
+
+
+def _row_snapshot(env: BatchedUmbralEnv, r: int) -> dict[str, np.ndarray]:
+    """The physical state of one row, as ``UmbralEnv.snapshot`` (for the viewer).
+
+    The neutral objects always include the probe slot (far outside the arena while absent),
+    so every step has the same shape.
+    """
+    a = env.row_arena(r)
+    touch = env.raw[r, env.layout.slices["touch"]].reshape(env.layout.shapes["touch"])
+    nn, j = int(env.neutral_on[r, :env.probe_slot].sum()), env.probe_slot
+    probe = env.neutral_pos[r, j] if env.neutral_on[r, j] else np.array([-1e3, -1e3])
+    return {"trunk_pose": np.array([*env.pos[r], env.heading[r]]), "limb_points": env.limbs[r].copy(),
+            "food_pos": a.food_pos.copy(), "food_active": a.food_active.copy(),
+            "neutral_pos": np.vstack([env.neutral_pos[r, :nn], probe]), "touch_intensity": touch[:, 0].copy()}
+
+
 @torch.no_grad()
 def run_battery(agent: Agent, config: Config, history: str, episodes: int | None = None,
-                steps: int | None = None) -> dict[str, list[float]]:
-    """The battery for one agent; returns ``{measure: [value per episode]}``."""
+                steps: int | None = None, record: Sequence[int] = ()) -> dict[str, list[float]]:
+    """The battery for one agent; returns ``{measure: [value per episode]}``.
+
+    ``record``: episode indices whose every step is also kept (``RECORD_KEYS``, plus the
+    static arena), returned under ``"recordings"`` ({index: {key: array}}). Recording only
+    reads the state: the measures are the same with or without it.
+    """
     bc = config.behavior
     n = int(bc.episodes if episodes is None else episodes)
     T = int(bc.steps if steps is None else steps)
@@ -103,6 +128,7 @@ def run_battery(agent: Agent, config: Config, history: str, episodes: int | None
     active: dict[int, dict[str, Any]] = {}
     was_neutral = np.zeros(n, bool)
     tl = env.layout.slices["touch"]
+    rec = {int(r): {k: [] for k in RECORD_KEYS} for r in record}
     mark()
     for t in range(T):
         if t >= offset and (t - offset) % every == 0:
@@ -114,8 +140,21 @@ def run_battery(agent: Agent, config: Config, history: str, episodes: int | None
                     active[r] = {"t0": t, "d0": d0, "first": None}
         h = world.step_hidden(torch.as_tensor(o, dtype=torch.float32), torch.as_tensor(prev, dtype=torch.float32), h)
         a, *_ = agent.act(h[0], noise.sample())
+        if rec:
+            with torch.no_grad():
+                mean = torch.tanh(agent.policy(h[0])[0]).double().numpy()
         p0 = env.pos.copy()
         obs, _, _, _, info = env.step(a)
+        for r, rr in rec.items():
+            bal = info["energy_balance"]
+            row = {"obs_flat": obs["flat"][r], "raw_flat": env.raw[r].copy(), "action_mean": mean[r],
+                   "energy": info["energy"][r], "fatigue": info["fatigue"][r], "food_eaten": info["food_eaten"][r],
+                   "contacts": info["contacts"][r],
+                   **{k: info[k][r] for k in ("action_intended", "action_applied", "action_executed")},
+                   **{k: (np.nan if bal is None else bal[k][r]) for k in ("basal", "effort_cost", "food_gain")},
+                   **_row_snapshot(env, r)}
+            for k in RECORD_KEYS:
+                rr[k].append(np.array(row[k], copy=True))
         o, prev = obs["flat"], info["action_intended"]
         acc["distance"] += np.sqrt(((env.pos - p0) ** 2).sum(-1))
         mark()
@@ -161,6 +200,19 @@ def run_battery(agent: Agent, config: Config, history: str, episodes: int | None
                            else float("nan") for ps in probes],
         "probes": [len(ps) for ps in probes],
     }
+    if rec:
+        out["recordings"] = {}
+        for r, rr in rec.items():
+            arr = {k: np.asarray(v, dtype=None if k in ("food_active", "food_eaten", "contacts") else np.float32)
+                   for k, v in rr.items()}
+            arena, prm = env.row_arena(r), env.params
+            arr.update(arena_size=np.float32(arena.size), trunk_radius=np.float32(prm.trunk_radius),
+                       obstacle_pos=arena.obstacle_pos.astype(np.float32),
+                       obstacle_r=arena.obstacle_r.astype(np.float32), food_r=arena.food_r.astype(np.float32),
+                       neutral_r=np.r_[env.neutral_r[r, :int(env.neutral_on[r, :env.probe_slot].sum())],
+                                       radius].astype(np.float32), history_id=np.array(str(history)),
+                       env_seed=np.int64(seeds[r]))
+            out["recordings"][r] = arr
     return out
 
 
