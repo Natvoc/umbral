@@ -666,3 +666,31 @@ def test_evaluation_with_the_agents_own_policy(tmp_path, infancy, common_start):
         assert v["agent"] == again["channels"][c]["agent"] and v["childhood"] == again["channels"][c]["childhood"]
         assert v["agent"] != r["ou"]["channels"][c]["agent"]  # other data: the agent's own behaviour
         assert set(v["by_history"]) == {"0", "1", "2", "3"}
+
+
+def test_the_individual_rule_stops_the_life_at_the_limit(tmp_path, infancy):
+    # Bodies start with no energy: a stretch at 0 starts at once. Limit of 5 steps, warm-up 0.3 iterations.
+    d = run_experiment(life_config(tmp_path, infancy, "run.name=zlim", "life.run_report=false",
+                                   "body.energy.initial=0.0", "ethics.zero_run_limit=5"))
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    assert meta["life_status"] == "flagged" and meta["flag_reason"] == "zero_run"
+    z = meta["ethics"]["zero_runs"]
+    assert z["flagged_at_iteration"] == 1 and z["longest"] >= 5 and meta["ethics"]["zero_run_limit"] == 5
+    assert (d / "flagged_summary.json").is_file() and (d / "checkpoints" / "iter_0000001.pt").is_file()
+    assert "individual rule" in (d / "log.txt").read_text(encoding="utf-8")
+
+
+def test_without_a_limit_the_individual_rule_only_observes(tmp_path, infancy):
+    d = run_experiment(life_config(tmp_path, infancy, "run.name=znolim", "life.run_report=false",
+                                   "body.energy.initial=0.0", "ethics.zero_run_limit=null", "ethics.max_low_fraction=1.0"))
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    assert meta["life_status"] == "completed" and meta["flag_reason"] is None
+    assert meta["ethics"]["zero_runs"]["flagged_at_iteration"] is None
+
+
+def test_the_battery_marks_episodes_for_review(tmp_path, infancy):
+    from umbral.experiments.agent import battery_review
+
+    cfg = life_config(tmp_path, infancy, "ethics.zero_run_limit=200")
+    assert battery_review({"energy_zero_run": [0.0, 199.0, 200.0, 1404.0]}, cfg) == [2, 3]
+    assert battery_review({"energy_zero_run": [1404.0]}, life_config(tmp_path, infancy, "ethics.zero_run_limit=null")) == []

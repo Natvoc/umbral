@@ -103,6 +103,8 @@ def _finish(entry: dict[str, Any], run_dir: Path | None) -> None:
     if life == "completed" and (run_dir / "checkpoints" / "life_long.pt").is_file():
         entry["status"] = "done"
         entry["life_long"] = str(run_dir / "checkpoints" / "life_long.pt")
+        if meta.get("battery_review"):  # individual rule in the battery: the agent waits for review
+            entry["review"] = meta["battery_review"]
     elif life == "flagged":
         entry["status"] = "flagged"
     else:

@@ -614,6 +614,9 @@ class Life:
             for thr in thresholds:
                 if it_max >= thr and ex.get(f"zero_would_flag_{thr}") is None:
                     ex[f"zero_would_flag_{thr}"] = it
+            limit = self.config.ethics.zero_run_limit
+            if limit is not None and it_max >= int(limit) and ex.get("zero_run_flag_iteration") is None:
+                ex["zero_run_flag_iteration"] = it  # the individual rule: run() stops the life
         ending = self.life_left == 0  # these bodies restart at the next iteration
         close(cur[ending & (cur > 0)])
         cur[ending] = 0
@@ -652,7 +655,8 @@ class Life:
             "stretches": int(e.get("zero_runs", 0)) + len(open_),
             "longest": max(int(e.get("zero_run_longest", 0)), int(open_.max()) if len(open_) else 0),
             "slot_longest": [int(x) for x in e.get("zero_slot_max", [0] * self.N)]}
-        out["would_flag_at_iteration"] = {}  # observation only: the individual rule never stops a life
+        out["flagged_at_iteration"] = e.get("zero_run_flag_iteration")  # the active individual rule
+        out["would_flag_at_iteration"] = {}  # the candidate thresholds, observation only
         for thr in [int(x) for x in self.config.ethics.zero_run_thresholds]:
             out["would_flag_at_iteration"][str(thr)] = e.get(f"zero_would_flag_{thr}")
             extra = int((open_ >= thr).sum())
@@ -680,6 +684,7 @@ class Life:
                                 "energy_p10": _hist_quantile(e.get(f"hist_{ph}"), 0.10)}
                            for ph in ("infancy", "adult")},
                 "zero_runs": self.zero_run_summary(),
+                "zero_run_limit": self.config.ethics.zero_run_limit,
                 "infancy_end_iteration": self.infancy_end,
                 "energy_curve": list(self.energy_curve),
                 "energy_curve_every_iterations": self.log_every}
@@ -687,12 +692,19 @@ class Life:
     def run(self) -> dict[str, Any]:
         wall0 = time.perf_counter()
         done_here = 0
-        status = "completed"
+        status, flag_reason = "completed", None
         end = self.iterations if self.stop_at is None else min(self.stop_at, self.iterations)
         for it in range(self.start + 1, end + 1):
             self.step(it)
             done_here += 1
             elapsed = self.elapsed_before + time.perf_counter() - wall0
+            if self.ethics.get("zero_run_flag_iteration") is not None:  # individual rule, checked every iteration
+                self._log(it)
+                self.rec.log(f"iteration {it}: a body reached {int(self.config.ethics.zero_run_limit)} steps in a row "
+                             f"at energy 0 (individual rule)")
+                self.checkpoint(it, f"iter_{it:07d}", elapsed)
+                status, flag_reason = "flagged", "zero_run"
+                break
             if it % self.log_every == 0 or it == end:
                 self._log(it)
                 per = (time.perf_counter() - wall0) / done_here
@@ -703,7 +715,7 @@ class Life:
                 if chk.get("steps_checked", 0) and chk["low_checked"] / chk["steps_checked"] > float(
                         self.config.ethics.max_low_fraction):
                     self.checkpoint(it, f"iter_{it:07d}", elapsed)
-                    status = "flagged"
+                    status, flag_reason = "flagged", "low_fraction"
                     break
                 if self.feeding and self.ramp["next_eval"] is not None and it >= self.ramp["next_eval"]:
                     self.ramp["next_eval"] = it + self.eval_every
@@ -740,6 +752,7 @@ class Life:
         total = sum(self.times.values()) or 1.0
         summary = {
             "life_status": status,
+            "flag_reason": flag_reason,
             "iterations_this_run": done_here,
             "wall_seconds": round(wall, 1),
             "life_seconds": round(self.elapsed_before + wall, 1),

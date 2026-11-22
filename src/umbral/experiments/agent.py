@@ -149,8 +149,10 @@ def run_live_agent(config: Config, recorder: Recorder, np_rng: np.random.Generat
     d = recorder.run_dir
     if summary["life_status"] == "flagged":
         (d / "flagged_summary.json").write_text(json.dumps(summary["ethics"], indent=2) + "\n", encoding="utf-8")
-        recorder.log(f"FLAGGED by the ethics rule: {summary['ethics']['fraction_below_0.1_after_warmup']:.3f} "
-                     f"of the life below {config.ethics.low_energy} after warm-up")
+        recorder.log(f"FLAGGED by the ethics rule ({summary['flag_reason']}): "
+                     f"{summary['ethics']['fraction_below_0.1_after_warmup']:.3f} of the life below "
+                     f"{config.ethics.low_energy} after warm-up; longest stretch at energy 0 of one body "
+                     f"{summary['ethics']['zero_runs']['longest']} steps (limit {config.ethics.zero_run_limit})")
         return
     recorder.log(f"life {summary['life_status']}: {summary['env_steps_per_second']} steps/s, "
                  f"time fractions {summary['time_fractions']}")
@@ -159,12 +161,18 @@ def run_live_agent(config: Config, recorder: Recorder, np_rng: np.random.Generat
         agent.eval()
         beh = run_battery(agent, config, str(config.agent.history))
         (d / "behavior.json").write_text(json.dumps(beh, indent=2) + "\n", encoding="utf-8")
+        review = {"behavior": battery_review(beh, config)}
         short = find_checkpoint(d, "life_short")
         if short is not None:
             agent_s, _ = load_agent(load_checkpoint(short))
             beh_s = run_battery(agent_s, config, str(config.agent.history))
             beh_s["checkpoint"] = str(short)
             (d / "behavior_short.json").write_text(json.dumps(beh_s, indent=2) + "\n", encoding="utf-8")
+            review["behavior_short"] = battery_review(beh_s, config)
+        if any(review.values()):  # the individual rule in the battery: stops nothing, marks for review
+            recorder.update_meta(battery_review=review)
+            recorder.log(f"REVIEW: battery episodes with a stretch at energy 0 >= {config.ethics.zero_run_limit} "
+                         f"steps: {review}")
         pc = prediction_check(agent.world, config.agent.infancy, config)
         (d / "prediction_check.json").write_text(json.dumps(pc, indent=2) + "\n", encoding="utf-8")
         for c, v in pc["channels"].items():
@@ -206,8 +214,10 @@ def run_common_feeding(config: Config, recorder: Recorder, np_rng: np.random.Gen
     (d / "feeding_summary.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
     if summary["life_status"] == "flagged":
         (d / "flagged_summary.json").write_text(json.dumps(summary["ethics"], indent=2) + "\n", encoding="utf-8")
-        recorder.log(f"FLAGGED by the ethics rule: {summary['ethics']['fraction_below_0.1_after_warmup']:.3f} "
-                     f"of the phase below {config.ethics.low_energy} after warm-up")
+        recorder.log(f"FLAGGED by the ethics rule ({summary['flag_reason']}): "
+                     f"{summary['ethics']['fraction_below_0.1_after_warmup']:.3f} of the phase below "
+                     f"{config.ethics.low_energy} after warm-up; longest stretch at energy 0 of one body "
+                     f"{summary['ethics']['zero_runs']['longest']} steps")
     recorder.log(f"feeding {summary['life_status']}: action std {out['log_std']['std_init_mean']:.3f} -> "
                  f"{out['log_std']['std_final_mean']:.3f} (x{out['log_std']['std_ratio_final_over_init']:.2f})")
     recorder.log(f"cost factor at the end {out['cost_factor_final']:.3f}; full cost from iteration "
@@ -215,6 +225,18 @@ def run_common_feeding(config: Config, recorder: Recorder, np_rng: np.random.Gen
     if f["evals"]:
         plot_feeding(f["evals"], config, d / "feeding_criterion.png")
     plot_feeding_curves(run_chain(d), d / "feeding_curves.png")
+
+
+def battery_review(beh: dict[str, Any], config: Config) -> list[int]:
+    """Battery episodes whose longest stretch at energy 0 reaches ``ethics.zero_run_limit``.
+
+    The individual rule in the battery: it stops nothing (the battery does not learn), but
+    the episodes are marked and the agent is left for review before going on.
+    """
+    limit = config.ethics.zero_run_limit
+    if limit is None:
+        return []
+    return [i for i, r in enumerate(beh.get("energy_zero_run", [])) if r >= int(limit)]
 
 
 def energy_zero_summary(beh: dict[str, list[float]] | None) -> dict[str, Any] | None:
@@ -448,9 +470,17 @@ def run_agent_report(config: Config, recorder: Recorder, np_rng: np.random.Gener
             recorder.log(f"{name} energy-0 stretches per body: longest {z['longest']} steps, "
                          + "  ".join(f">={t}: {z[f'ge{t}']} ({z[f'ge{t}_after_warmup']} after warm-up)"
                                      for t in (200, 500, 1000)))
-            recorder.log(f"{name} individual rule (observation only, stops nothing): " + "  ".join(
-                f">={t} steps: " + (f"would have stopped the life at iteration {v}" if v is not None else "would not stop")
-                for t, v in z.get("would_flag_at_iteration", {}).items()))
+            recorder.log(f"{name} individual rule (limit {config.ethics.zero_run_limit} steps): "
+                         + (f"stopped the life at iteration {z['flagged_at_iteration']}"
+                            if z.get("flagged_at_iteration") is not None else "did not stop the life")
+                         + "; candidate thresholds: " + "  ".join(
+                             f">={t}: " + (f"iteration {v}" if v is not None else "no")
+                             for t, v in z.get("would_flag_at_iteration", {}).items()))
+        for key in ("behavior_short", "behavior"):
+            rv = battery_review(info.get(key) or {}, config)
+            if rv:
+                recorder.log(f"{name} REVIEW {key}: episodes {rv} reach {config.ethics.zero_run_limit} steps in a "
+                             f"row at energy 0")
         for ph, v in info["drive_shares"].items():
             if v:
                 recorder.log(f"{name} {ph} drive shares: " + "  ".join(
