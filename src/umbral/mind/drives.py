@@ -20,7 +20,11 @@ world directly.
   the effort executed), down to ``drives.debt_floor``; eating sets it back to the
   physical energy after eating (the food settles the debt). Hunger is then
   ``hunger_scale * (D(E_int,t) - D(E_int,t+1))``: at 0 the signal goes on as just before
-  reaching 0, with no false relief. ``E_int`` is used for this reward only: the mind
+  reaching 0, with no false relief. Below 0, ``D`` goes on as a straight line with its
+  slope at 0, ``D(E) = E*^2 - 2 E* E`` (decided 25 Nov 2026): the reward of a step in debt
+  is ``-hunger_scale * 2 E* * cost``, constant for the same cost, the limit of the steps
+  just before 0. The rule of minimal aversive signals requires that the debt does not
+  intensify the punishment (with the parabola it grew with the depth of the debt). ``E_int`` is used for this reward only: the mind
   does not observe it (interoception is still the physical energy), and the curiosity
   gate still uses the observed energy. The cost per step comes from the body's energy
   balance: it is the experimenter's reward function, never part of the observation.
@@ -92,7 +96,9 @@ def temperament_from_config(config, name: str) -> Temperament:
 
 
 def homeostatic_drive(energy: np.ndarray, set_point: float) -> np.ndarray:
-    return (set_point - energy) ** 2
+    """``D(E) = (E* - E)**2`` for ``E >= 0``; below 0 (energy debt) its tangent at 0, ``E*^2 - 2 E* E``."""
+    energy = np.asarray(energy, dtype=float)
+    return np.where(energy >= 0.0, (set_point - energy) ** 2, set_point * set_point - 2.0 * set_point * energy)
 
 
 def hunger_gate(energy: np.ndarray, set_point: float, low: float) -> np.ndarray:

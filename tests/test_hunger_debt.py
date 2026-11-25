@@ -13,7 +13,7 @@ from conftest import make_config, read_metrics
 from test_agent import LAYOUT, infancy, life_config, obs_with  # noqa: F401  (fixture)
 from umbral.checkpoint import load_checkpoint
 from umbral.cli import run_experiment
-from umbral.mind.drives import Drives, Temperament, hunger_reward, internal_energy_step
+from umbral.mind.drives import Drives, Temperament, homeostatic_drive, hunger_reward, internal_energy_step
 
 CFG = make_config()
 SP, HS = float(CFG.drives.set_point), float(CFG.drives.hunger_scale)
@@ -42,6 +42,22 @@ def drives_hunger(e_obs: np.ndarray, e_int: np.ndarray | None, debt: bool = True
     return c["weighted"]["hunger"][0]
 
 
+def D(e):
+    """The drive by hand: the parabola above 0, its tangent at 0 below."""
+    e = np.asarray(e, float)
+    return np.where(e >= 0, (SP - e) ** 2, SP ** 2 - 2 * SP * e)
+
+
+def test_below_zero_the_drive_is_the_tangent_at_zero():
+    e = np.array([0.5, 0.0, -1e-9, -0.1, -1.0])
+    np.testing.assert_array_equal(homeostatic_drive(e, SP), D(e))
+    h = 1e-7  # continuous, with the same slope on both sides of 0
+    left, right = (homeostatic_drive(0.0, SP) - homeostatic_drive(-h, SP)) / h, (
+        homeostatic_drive(h, SP) - homeostatic_drive(0.0, SP)) / h
+    np.testing.assert_allclose(left, -2 * SP, rtol=1e-8)
+    np.testing.assert_allclose(right, -2 * SP, rtol=1e-5)
+
+
 def test_the_debt_is_on_by_default_with_its_floor():
     assert CFG.drives.hunger_debt is True and FLOOR == -1.0
 
@@ -67,11 +83,16 @@ def test_at_zero_the_signal_goes_on_as_just_before_and_never_vanishes():
     assert (v1[zero] == 0.0).all()  # before: no signal at all at 0 (the false relief)
     assert (debt[zero] < 0.0).all()  # now: it goes on
     np.testing.assert_allclose(debt[:first - 1], v1[:first - 1])  # identical while E > 0
-    np.testing.assert_allclose(debt, HS * ((SP - ei[:-1]) ** 2 - (SP - ei[1:]) ** 2))
-    # with the same cost, a step at 0 is the step before plus only the curvature of D (2 c^2 per step of debt)
+    np.testing.assert_allclose(debt, HS * (D(ei[:-1]) - D(ei[1:])))
+    # in debt the reward per step is constant: the slope of D at 0 times the cost, however deep the debt
+    np.testing.assert_allclose(debt[zero], -HS * 2 * SP * c, rtol=1e-9)
+    assert ei[-1] < -0.04
+    # the same as the last whole step before 0 with the same cost, but for the parabola's curvature there
+    # (HS * c * (2 E - c) with E < 2c: at most 1e-3 of the step here); with the parabola it grew with the debt
     before = debt[first - 2]
-    for k, t in enumerate(zero[:5]):
-        np.testing.assert_allclose(debt[t], before - HS * 2 * c * c * (t - (first - 2)), rtol=1e-9, atol=1e-12)
+    assert abs(debt[zero] - before).max() <= HS * c * (2 * e[first - 2] - c) * (1 + 1e-9)
+    parabola = HS * ((SP - ei[:-1]) ** 2 - (SP - ei[1:]) ** 2)
+    assert (np.diff(parabola[zero]) < 0).all() and np.ptp(debt[zero]) < 1e-12
     np.testing.assert_allclose(ei[-1], 0.0050 - 40 * c)  # the debt accumulates what the body would have spent
 
 
@@ -83,7 +104,7 @@ def test_eating_at_zero_settles_the_debt():
     assert e[150] == 0.0 and debt_before < -0.2
     assert ei[151] == e[151] and np.isclose(e[151], 0.3 - c)  # the food settles the debt: back to the physical energy
     h = drives_hunger(e, ei)
-    np.testing.assert_allclose(h[150], HS * ((SP - debt_before) ** 2 - (SP - e[151]) ** 2))
+    np.testing.assert_allclose(h[150], HS * (D(debt_before) - D(e[151])))
     assert h[150] > drives_hunger(e, None, debt=False)[150] > 0  # worth more than the meal from 0 was before
     assert (ei[151:] == e[151:]).all()
 
