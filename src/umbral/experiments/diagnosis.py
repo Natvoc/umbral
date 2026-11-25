@@ -16,6 +16,13 @@ It reports (``diagnosis.json``):
 - per body touching food without eating: which touch sensor touches it, how far the
   limb tips are, and whether moving only the joints (trunk still) could reach it.
 
+Hunger with and without the energy debt (25 Nov 2026): on the same steps, ``hunger_v1``
+(the observed energy, the drive before the correction) and ``hunger_debt`` (the internal
+energy ``E_int``, ``umbral.mind.drives``), whatever the checkpoint's own configuration
+used (``hunger`` is the one it used). ``E_int`` starts from the checkpoint's record when
+it has one; older checkpoints have none, so bodies already at 0 start without debt
+(``debt_start``), which can only make the debt look smaller.
+
 It changes nothing and stops nothing.
 """
 
@@ -34,7 +41,7 @@ from umbral.config import Config
 from umbral.experiments.agent import load_agent
 from umbral.experiments.registry import register
 from umbral.mind.agent import GaussianNoise
-from umbral.mind.drives import Drives, temperament_from_config
+from umbral.mind.drives import Drives, hunger_reward, internal_energy_step, temperament_from_config
 from umbral.recorder import Recorder
 from umbral.world.arena import KIND_NAMES
 from umbral.world.batched import BatchedUmbralEnv
@@ -52,7 +59,7 @@ def _angle(a: np.ndarray) -> np.ndarray:
 
 
 @torch.no_grad()
-def diagnose(ck: Checkpoint, steps: int, limit: int) -> dict[str, Any]:
+def diagnose(ck: Checkpoint, steps: int, limit: int, debt_floor: float = -1.0) -> dict[str, Any]:
     cfg = Config(ck.config)
     agent, _ = load_agent(ck)
     N = int(cfg.life.n_envs)
@@ -84,6 +91,10 @@ def diagnose(ck: Checkpoint, steps: int, limit: int) -> dict[str, Any]:
     pos[0], heading[0], q[0] = env.pos, env.heading, env.q
     food_pos[0], food_on[0] = env.food_pos, env.food_active
     e_before = env.energy.copy()
+    ei = env.layout.slices["intero"].start
+    has_debt = "e_int" in extra
+    e_int = np.empty((N, T + 1))
+    e_int[:, 0] = np.array(extra["e_int"], float) if has_debt else o[:, ei]
     for t in range(T):
         h = world.step_hidden(torch.as_tensor(o, dtype=torch.float32), torch.as_tensor(prev, dtype=torch.float32), h)
         a, _, _, v = agent.act(h[0], noise.sample())
@@ -97,18 +108,27 @@ def diagnose(ck: Checkpoint, steps: int, limit: int) -> dict[str, Any]:
         e_before = info["energy"]
         effort[:, t] = (info["action_executed"] ** 2).mean(-1)
         eaten[:, t] = info["food_eaten"]
+        bal = info["energy_balance"]
+        cost = np.zeros(N) if bal is None else np.where(info["frozen"], 0.0, bal["basal"] + bal["effort_cost"])
+        e_int[:, t + 1] = internal_energy_step(e_int[:, t], o[:, ei], cost, info["food_eaten"] > 0, debt_floor)
         pos[t + 1], heading[t + 1], q[t + 1] = env.pos, env.heading, env.q
         food_pos[t + 1], food_on[t + 1] = env.food_pos, env.food_active
         tt = env.raw[:, tl].reshape(N, 10, 6)
         touch_kind[t] = np.where(tt[..., 0] > 0, tt[..., 1:].argmax(-1), -1)
     cur, nxt = torch.as_tensor(obs[:, :-1], dtype=torch.float32), torch.as_tensor(obs[:, 1:], dtype=torch.float32)
     pred = world.predict_next(cur, world.from_hidden(cur, hid, torch.as_tensor(act, dtype=torch.float32)))
-    _, comps = drives(obs[:, :-1], obs[:, 1:], pred.double().numpy(), act)
+    _, comps = drives(obs[:, :-1], obs[:, 1:], pred.double().numpy(), act, e_int)
     w = comps["weighted"]
+    sp, hs = drives.set_point, drives.hunger_scale
+    h_v1 = hunger_reward(obs[:, :-1, ei], obs[:, 1:, ei], sp, hs)
+    h_debt = hunger_reward(e_int[:, :-1], e_int[:, 1:], sp, hs)
 
     out: dict[str, Any] = {"checkpoint_step": ck.step, "temperament": drives.temperament.name,
                            "history": str(cfg.agent.history), "metabolism": float(env.metabolism),
-                           "steps": T, "bodies": N, "bands": {}}
+                           "steps": T, "bodies": N, "hunger_debt_in_config": drives.hunger_debt,
+                           "debt_start": "checkpoint" if has_debt else "observed energy (no debt record)",
+                           "debt_floor": float(debt_floor), "debt_min": float(e_int.min()),
+                           "debt_floor_steps": int((e_int[:, 1:] <= debt_floor).sum()), "bands": {}}
     for band, sel in BANDS.items():
         m = sel(energy)
         n = int(m.sum())
@@ -116,6 +136,7 @@ def diagnose(ck: Checkpoint, steps: int, limit: int) -> dict[str, Any]:
         out["bands"][band] = {
             "steps": n, "hunger": f(w["hunger"]), "curiosity": f(w["curiosity"]), "caution": f(w["caution"]),
             "total": f(w["hunger"] + w["curiosity"] + w["caution"]), "gate": f(comps["gate"]), "value": f(value),
+            "hunger_v1": f(h_v1), "hunger_debt": f(h_debt), "e_int_mean": f(e_int[:, :-1]),
             "action_abs": float(np.abs(act)[m].mean()) if n else None, "effort": f(effort),
             "eats_per_1000_steps": float(eaten[m].sum() / n * 1000) if n else None,
             "hunger_positive_fraction": float((w["hunger"][m] > 0).mean()) if n else None}
@@ -154,7 +175,12 @@ def diagnose(ck: Checkpoint, steps: int, limit: int) -> dict[str, Any]:
             bodies.append({"body": b, "start": s, "length": e - s, "ends_by": "window end" if e == T else "energy rose",
                            "nearest_food": float(d[j]), "turn_needed_rad": ang, "straight_line_steps_needed": need,
                            "strength_at_zero": s0, "path": path, "net_approach": float(d[j]) - d_end,
-                           "turned_rad": turned, "box": [float(np.ptp(pos[s:e + 1, b, 0])), float(np.ptp(pos[s:e + 1, b, 1]))],
+                           "turned_rad": turned,
+                           "hunger_before": float(h_v1[b, s - 1]) if s > 0 else None,
+                           "hunger_v1_during": float(h_v1[b, s:e].mean()),
+                           "hunger_debt_during": float(h_debt[b, s:e].mean()),
+                           "hunger_debt_first": float(h_debt[b, s]), "hunger_debt_last": float(h_debt[b, e - 1]),
+                           "e_int_end": float(e_int[b, e]), "box": [float(np.ptp(pos[s:e + 1, b, 0])), float(np.ptp(pos[s:e + 1, b, 1]))],
                            "contacts": {KIND_NAMES[k]: float((touch_kind[s:e, b] == k).sum(-1).mean())
                                         for k in range(5) if (touch_kind[s:e, b] == k).any()}})
     out["zero_stretches"] = bodies
@@ -202,7 +228,8 @@ def run_zero_diagnosis(config: Config, recorder: Recorder, np_rng: np.random.Gen
                        resume: Checkpoint | None) -> None:
     path = Path(str(config.diagnosis.checkpoint))
     out = {"checkpoint": str(path), **diagnose(load_checkpoint(path), int(config.diagnosis.steps),
-                                                int(config.ethics.zero_run_limit or 200))}
+                                                int(config.ethics.zero_run_limit or 200),
+                                                float(config.drives.debt_floor))}
     (recorder.run_dir / "diagnosis.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
     for band, v in out["bands"].items():
         recorder.log(f"{band}: " + "  ".join(f"{k} {x:.4g}" if isinstance(x, float) else f"{k} {x}"

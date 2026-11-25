@@ -205,6 +205,7 @@ def test_life_resume_reproduces_the_continuation(tmp_path, infancy):
         np.testing.assert_array_equal(arr, b.env["arrays"][k], err_msg=k)
     assert a.policy["rngs"] == b.policy["rngs"]
     assert a.extra["drives"] == b.extra["drives"] and a.extra["scaler"] == b.extra["scaler"]
+    assert a.extra["e_int"] == b.extra["e_int"]  # the energy debt of hunger
     assert set(a.optimizers) == {"world", "policy"}
     names = {json.loads(line)["name"] for line in read_metrics(full)}
     assert {"ppo_approx_kl", "ppo_clip_fraction", "reward_curiosity", "energy_below_0.1",
@@ -706,8 +707,11 @@ def test_zero_diagnosis_reports_the_drives_at_energy_zero(tmp_path, infancy):
                                    "diagnosis.steps=40", "ethics.zero_run_limit=5", "run.name=zdiag"))
     r = json.loads((d / "diagnosis.json").read_text(encoding="utf-8"))
     z = r["bands"]["zero"]
-    assert z["steps"] > 0 and z["hunger"] == 0.0 and z["curiosity"] == 0.0 and z["gate"] == 0.0  # no drive but caution
-    assert z["caution"] <= 0.0 and z["total"] == z["caution"]
+    assert z["steps"] > 0 and z["curiosity"] == 0.0 and z["gate"] == 0.0
+    assert z["hunger_v1"] == 0.0 and z["hunger_debt"] < 0.0  # before: no drive but caution; with the debt, hunger goes on
+    assert z["hunger"] == z["hunger_debt"] and r["hunger_debt_in_config"] and r["debt_min"] < 0.0
+    assert r["debt_start"] == "checkpoint" and all(x["hunger_debt_during"] < 0.0 for x in r["zero_stretches"])
+    assert z["caution"] <= 0.0 and np.isclose(z["total"], z["hunger"] + z["caution"])
     assert "infancy" in r["training_exposure"] and isinstance(r["zero_stretches"], list)
     again = run_experiment(life_config(tmp_path, infancy, "experiment=zero_diagnosis", f"diagnosis.checkpoint={ck.as_posix()}",
                                        "diagnosis.steps=40", "ethics.zero_run_limit=5", "run.name=zdiag2"))

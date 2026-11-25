@@ -9,6 +9,21 @@ world directly.
   step t is ``hunger_scale * (D(E_t) - D(E_{t+1}))``: positive when energy moves
   towards the set point ``E*``, negative when it moves away, and no larger than
   that change.
+
+  **Energy debt** (``drives.hunger_debt``, since 25 Nov 2026; before it, hunger v1).
+  The physical energy has its floor at 0, so with ``E`` alone the drive stopped at 0:
+  ``D`` could not rise any more, the punishment of every step ended there, and reaching
+  0 worked as a relief (the 22 Nov diagnosis: the critic valued energy 0 *above* energy
+  just over it). Hunger now uses an internal energy ``E_int``, which can be negative:
+  ``E_int = E`` while ``E > 0`` (exactly as before); at ``E = 0`` it keeps falling every
+  step by the cost the body would have paid (effective basal metabolism plus the cost of
+  the effort executed), down to ``drives.debt_floor``; eating sets it back to the
+  physical energy after eating (the food settles the debt). Hunger is then
+  ``hunger_scale * (D(E_int,t) - D(E_int,t+1))``: at 0 the signal goes on as just before
+  reaching 0, with no false relief. ``E_int`` is used for this reward only: the mind
+  does not observe it (interoception is still the physical energy), and the curiosity
+  gate still uses the observed energy. The cost per step comes from the body's energy
+  balance: it is the experimenter's reward function, never part of the observation.
 - **Curiosity**: the prediction error of the mind's own model on the next
   observation, divided by a running mean (exponential moving average) of that
   error, so its typical size is 1. Only channels that look at the *world* count:
@@ -90,6 +105,14 @@ def hunger_reward(e_now: np.ndarray, e_next: np.ndarray, set_point: float, scale
     return scale * (homeostatic_drive(e_now, set_point) - homeostatic_drive(e_next, set_point))
 
 
+def internal_energy_step(e_int: np.ndarray, e_next: np.ndarray, cost: np.ndarray, ate: np.ndarray,
+                         floor: float) -> np.ndarray:
+    """``E_int`` after one step (all (N,)): the physical energy while it is above 0 or after eating,
+    otherwise the previous ``E_int`` minus the step's cost, never below ``floor``."""
+    debt = np.maximum(float(floor), e_int - cost)
+    return np.where((e_next > 0.0) | ate, e_next, debt)
+
+
 def caution_reward(action: np.ndarray, effort_cost: float, scale: float) -> np.ndarray:
     """``-scale * effort_cost * mean(a**2)`` over the last axis (intended action)."""
     return -scale * effort_cost * np.mean(action * action, axis=-1)
@@ -126,17 +149,24 @@ class Drives:
         self.gate_low = float(drives_cfg.gate_low)
         self.ema_rate = float(drives_cfg.curiosity_ema)
         self.effort_cost = float(effort_cost)
+        self.hunger_debt = bool(drives_cfg.get("hunger_debt", False))  # configs before 25 Nov 2026: hunger v1
+        self.debt_floor = float(drives_cfg.get("debt_floor", -1.0))
         self.error_mean: float | None = None  # running mean of the raw curiosity error
 
-    def __call__(self, cur: np.ndarray, nxt: np.ndarray, pred: np.ndarray, action: np.ndarray
-                 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    def __call__(self, cur: np.ndarray, nxt: np.ndarray, pred: np.ndarray, action: np.ndarray,
+                 e_int: np.ndarray | None = None) -> tuple[np.ndarray, dict[str, np.ndarray]]:
         """Rewards (B, T) for transitions ``o_t -> o_{t+1}`` with intended actions ``a_t``.
 
         ``pred`` is the mind's prediction of ``o_{t+1}``. The running mean is updated
-        once per call, with the batch mean, *after* normalising this batch.
+        once per call, with the batch mean, *after* normalising this batch. With
+        ``hunger_debt``, ``e_int`` (B, T+1) is the internal energy at every observation
+        and hunger uses it; without it (or with ``e_int`` None) hunger uses the observed energy.
         """
         e = self.layout.slices["intero"].start  # energy is the first interoceptive value
-        hunger = hunger_reward(cur[..., e], nxt[..., e], self.set_point, self.hunger_scale)
+        if self.hunger_debt and e_int is not None:
+            hunger = hunger_reward(e_int[..., :-1], e_int[..., 1:], self.set_point, self.hunger_scale)
+        else:
+            hunger = hunger_reward(cur[..., e], nxt[..., e], self.set_point, self.hunger_scale)
         err = world_prediction_error(self.layout, cur, nxt, pred)
         batch_mean = float(err.mean())
         if self.error_mean is None:

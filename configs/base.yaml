@@ -171,6 +171,9 @@ drives:
   curiosity_ema: 0.01           # rate of that running mean (per rollout)
   caution_scale: 25.0           # caution = -caution_scale * effort_cost * mean(a_t^2); 25 = calibrated (calib5, 21 Nov 2026)
   gate_low: 0.2                 # hunger gate g(E) = clip((E - gate_low) / (set_point - gate_low), 0, 1) multiplies curiosity only (caution is the brake)
+  hunger_debt: true             # energy debt (25 Nov 2026): hunger uses E_int, which keeps falling at E = 0 by the body's cost
+                                #   (no false relief at 0); not observed; false = hunger v1 (superseded_hunger_v1)
+  debt_floor: -1.0              # safety floor of E_int; bodies that reach it are reported
 
 agent:
   temperament: equilibrado      # key into temperaments

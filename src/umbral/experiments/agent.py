@@ -153,9 +153,13 @@ def run_live_agent(config: Config, recorder: Recorder, np_rng: np.random.Generat
                      f"{summary['ethics']['fraction_below_0.1_after_warmup']:.3f} of the life below "
                      f"{config.ethics.low_energy} after warm-up; longest stretch at energy 0 of one body "
                      f"{summary['ethics']['zero_runs']['longest']} steps (limit {config.ethics.zero_run_limit})")
+        if debt_report(summary["ethics"]):
+            recorder.log(debt_report(summary["ethics"]))
         return
     recorder.log(f"life {summary['life_status']}: {summary['env_steps_per_second']} steps/s, "
                  f"time fractions {summary['time_fractions']}")
+    if debt_report(summary["ethics"]):
+        recorder.log(debt_report(summary["ethics"]))
     if summary["life_status"] == "completed" and bool(config.life.run_report):
         agent = life.agent
         agent.eval()
@@ -218,6 +222,8 @@ def run_common_feeding(config: Config, recorder: Recorder, np_rng: np.random.Gen
                      f"{summary['ethics']['fraction_below_0.1_after_warmup']:.3f} of the phase below "
                      f"{config.ethics.low_energy} after warm-up; longest stretch at energy 0 of one body "
                      f"{summary['ethics']['zero_runs']['longest']} steps")
+    if debt_report(summary["ethics"]):
+        recorder.log(debt_report(summary["ethics"]))
     recorder.log(f"feeding {summary['life_status']}: action std {out['log_std']['std_init_mean']:.3f} -> "
                  f"{out['log_std']['std_final_mean']:.3f} (x{out['log_std']['std_ratio_final_over_init']:.2f})")
     recorder.log(f"cost factor at the end {out['cost_factor_final']:.3f}; full cost from iteration "
@@ -225,6 +231,20 @@ def run_common_feeding(config: Config, recorder: Recorder, np_rng: np.random.Gen
     if f["evals"]:
         plot_feeding(f["evals"], config, d / "feeding_criterion.png")
     plot_feeding_curves(run_chain(d), d / "feeding_curves.png")
+
+
+def debt_report(ethics: dict) -> str | None:
+    """One log line on the energy debt of hunger; ``DEBT FLOOR`` when a body reached the safety floor."""
+    d = ethics.get("hunger_debt")
+    if not d or not d.get("enabled"):
+        return None
+    mn = d.get("min")
+    line = (f"energy debt of hunger: minimum E_int {mn:.4f} (floor {d['floor']})" if mn is not None
+            else f"energy debt of hunger: no record (floor {d['floor']})")
+    if d.get("floor_steps"):
+        line = (f"DEBT FLOOR: {d['floor_bodies']} bodies reached the floor {d['floor']} of the energy debt "
+                f"({d['floor_steps']} steps, first at iteration {d['floor_first_iteration']}); " + line)
+    return line
 
 
 def battery_review(beh: dict[str, Any], config: Config) -> list[int]:
@@ -476,6 +496,8 @@ def run_agent_report(config: Config, recorder: Recorder, np_rng: np.random.Gener
                          + "; candidate thresholds: " + "  ".join(
                              f">={t}: " + (f"iteration {v}" if v is not None else "no")
                              for t, v in z.get("would_flag_at_iteration", {}).items()))
+        if debt_report(info["ethics"]):
+            recorder.log(f"{name} {debt_report(info['ethics'])}")
         for key in ("behavior_short", "behavior"):
             rv = battery_review(info.get(key) or {}, config)
             if rv:

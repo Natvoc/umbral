@@ -95,7 +95,7 @@ import torch
 from umbral.checkpoint import Checkpoint, load_checkpoint, make_checkpoint, save_checkpoint
 from umbral.config import Config
 from umbral.mind.agent import Agent, GaussianNoise, build_agent
-from umbral.mind.drives import Drives, RewardScaler, Temperament, temperament_from_config
+from umbral.mind.drives import Drives, RewardScaler, Temperament, internal_energy_step, temperament_from_config
 from umbral.mind.model import CHANNELS, build_model, channel_sq_error, n_parameters
 from umbral.mind.training import EVAL_SEED_BASE, POLICY_SEED_OFFSET, TRAIN_SEED_LIMIT, peak_memory_mb
 from umbral.recorder import Recorder
@@ -295,6 +295,7 @@ class Life:
             self.drives.caution_scale = float(config.feeding.caution_scale)  # the childhood's own caution scale
         self.scaler = RewardScaler(self.N, float(pc.gamma))
         self.noise = GaussianNoise(self.N, [0] * self.N)
+        self.e_idx = layout.slices["intero"].start  # observed energy
 
         if resume is None:
             self.np_rng = np_rng
@@ -324,6 +325,7 @@ class Life:
             self.env.reset(seed=[self._new_seed() for _ in range(self.N)])
             self.h = world.initial_state(self.N)
             self.prev_action = np.zeros((self.N, 6))
+            self.e_int = self._observed_energy()
             E = self.episode_rollouts
             self.life_left = stagger(self.histories, E)
             self.start, self.elapsed_before = 0, 0.0
@@ -339,6 +341,8 @@ class Life:
             self.h = resume.mind_state["h"].clone()
             self.prev_action = resume.mind_state["prev_action"].numpy().astype(float).copy()
             ex = resume.extra
+            self.e_int = (np.array(ex["e_int"], dtype=float) if "e_int" in ex  # before 25 Nov 2026: no debt saved
+                          else self._observed_energy())
             self.life_left = np.array(ex["life_left"], dtype=int)
             self.drives.set_state(ex["drives"])
             self.scaler.set_state(ex["scaler"])
@@ -355,6 +359,9 @@ class Life:
             temperament=self.temperament.name, history=self.history, n_envs=self.N, rollout=self.T,
             feeding_phase=self.feeding, histories_of_bodies=sorted(set(self.histories), key=int),
             n_parameters={"world": n_parameters(world), "policy": n_parameters(self.agent.policy)})
+
+    def _observed_energy(self) -> np.ndarray:
+        return self.env.observation()["flat"][:, self.e_idx].astype(float).copy()
 
     def _new_seed(self) -> int:
         return self.seed_base + int(self.np_rng.integers(0, TRAIN_SEED_LIMIT))
@@ -375,16 +382,20 @@ class Life:
             self.env.reset(seed=[self._new_seed() for _ in rows], envs=rows)
             self.h[:, rows] = 0.0
             self.prev_action[rows] = 0.0
+            self.e_int[rows] = self._observed_energy()[rows]  # a new episode starts without debt
             self.scaler.reset_rows(rows)
             self.life_left[rows] = self.episode_rollouts
         N, T, D, H = self.N, self.T, self.env.observation_dim, self.agent.world.hidden_size
         r = {"obs": np.empty((N, T + 1, D)), "act": np.empty((N, T, 6)), "prev": np.empty((N, T, 6)),
              "u": np.empty((N, T, 6), np.float32), "logp": np.empty((N, T), np.float32),
              "value": np.empty((N, T)), "hid": torch.empty(N, T, H), "h0": self.h.clone(),
-             "energy": np.empty((N, T)), "food": np.zeros(N), "effort": np.zeros(N)}
+             "energy": np.empty((N, T)), "food": np.zeros(N), "effort": np.zeros(N),
+             "e_int": np.empty((N, T + 1))}
         world = self.agent.world
         o = self.env.observation()["flat"]
         r["obs"][:, 0] = o
+        r["e_int"][:, 0] = self.e_int
+        floor = self.drives.debt_floor
         tw = tm = 0.0
         for t in range(T):
             ts = time.perf_counter()
@@ -405,6 +416,10 @@ class Life:
             r["energy"][:, t] = info["energy"]
             r["food"] += info["food_eaten"]
             r["effort"] += (info["action_executed"] ** 2).mean(-1)
+            bal = info["energy_balance"]  # the cost the body paid (or, at 0, would have paid) this step
+            cost = np.zeros(N) if bal is None else np.where(info["frozen"], 0.0, bal["basal"] + bal["effort_cost"])
+            self.e_int = internal_energy_step(self.e_int, o[:, self.e_idx], cost, info["food_eaten"] > 0, floor)
+            r["e_int"][:, t + 1] = self.e_int
             self.prev_action = intended
         ts = time.perf_counter()
         with torch.no_grad():  # bootstrap: h_T is recomputed identically at the next iteration's first step
@@ -463,7 +478,7 @@ class Life:
         prev = torch.as_tensor(r["prev"], dtype=torch.float32)
         with torch.no_grad():  # the prediction the mind made when acting (before learning from it)
             pred = world.predict_next(cur, world.from_hidden(cur, r["hid"], act))
-        rewards, comps = self.drives(r["obs"][:, :-1], r["obs"][:, 1:], pred.double().numpy(), r["act"])
+        rewards, comps = self.drives(r["obs"][:, :-1], r["obs"][:, 1:], pred.double().numpy(), r["act"], r["e_int"])
         scaled = self.scaler(rewards)
         adv, ret = gae(scaled, r["value"], r["last_value"], float(pc.gamma), float(pc.lam))
         sq = channel_sq_error(layout, pred, nxt)
@@ -552,6 +567,7 @@ class Life:
         self.ethics["food"] += int(r["food"].sum())
         self.ethics["energy_sum"] += float(e.sum())
         self._update_zero_runs(it, e, phase)
+        self._update_debt(it, r["e_int"][:, 1:])
         if it > self.iterations * float(self.config.ethics.warmup_fraction):
             self.ethics["steps_checked"] = self.ethics.get("steps_checked", 0) + e.size
             self.ethics["low_checked"] = self.ethics.get("low_checked", 0) + int(
@@ -623,6 +639,28 @@ class Life:
         ex["zero_cur"], ex["zero_slot_max"] = cur.tolist(), slot_max.tolist()
         self._add("energy_zero_run_max", it_max)
 
+    def _update_debt(self, it: int, e_int: np.ndarray) -> None:
+        """Energy debt of hunger (``ethics``, checkpointed): its minimum, and the steps and bodies at the floor."""
+        ex = self.ethics
+        at_floor = e_int <= self.drives.debt_floor
+        ex["debt_min"] = min(float(ex.get("debt_min", 1.0)), float(e_int.min()))
+        n = int(at_floor.sum())
+        if n:
+            ex["debt_floor_steps"] = ex.get("debt_floor_steps", 0) + n
+            slots = np.asarray(ex.get("debt_floor_slots", [0] * self.N), dtype=int) + at_floor.sum(1)
+            ex["debt_floor_slots"] = slots.tolist()
+            if ex.get("debt_floor_first_iteration") is None:
+                ex["debt_floor_first_iteration"] = it
+        self.rec.log_metric(it, "hunger_debt_min", float(e_int.min()))
+        self.rec.log_metric(it, "hunger_debt_steps", float((e_int < 0).mean()))
+
+    def debt_summary(self) -> dict[str, Any]:
+        e = self.ethics
+        slots = np.asarray(e.get("debt_floor_slots", [0] * self.N), dtype=int)
+        return {"enabled": self.drives.hunger_debt, "floor": self.drives.debt_floor, "min": e.get("debt_min"),
+                "floor_steps": int(e.get("debt_floor_steps", 0)), "floor_bodies": int((slots > 0).sum()),
+                "floor_first_iteration": e.get("debt_floor_first_iteration")}
+
     def _log(self, it: int) -> None:
         for k, v in self.acc.items():
             self.rec.log_metric(it, k, v / self.acc_n)
@@ -637,6 +675,7 @@ class Life:
         ckpt = make_checkpoint(
             it, {"agent": self.agent}, self.opts, self.np_rng, self.config,
             extra={"life_left": self.life_left.tolist(), "drives": self.drives.get_state(),
+                   "e_int": self.e_int.tolist(),
                    "scaler": {**self.scaler.get_state(), "ret": self.scaler.ret.tolist()},
                    "ethics": dict(self.ethics), "energy_curve": list(self.energy_curve),
                    "elapsed_seconds": elapsed, "temperament": self.temperament.name, "history": self.history,
@@ -685,6 +724,7 @@ class Life:
                            for ph in ("infancy", "adult")},
                 "zero_runs": self.zero_run_summary(),
                 "zero_run_limit": self.config.ethics.zero_run_limit,
+                "hunger_debt": self.debt_summary(),
                 "infancy_end_iteration": self.infancy_end,
                 "energy_curve": list(self.energy_curve),
                 "energy_curve_every_iterations": self.log_every}
