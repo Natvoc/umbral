@@ -23,6 +23,25 @@ used (``hunger`` is the one it used). ``E_int`` starts from the checkpoint's rec
 it has one; older checkpoints have none, so bodies already at 0 start without debt
 (``debt_start``), which can only make the debt look smaller.
 
+Checkpoints of the common feeding phase (``extra["history"] == "all"``, 26 Nov 2026) are
+diagnosed with their own mixed histories (``feeding_histories``) and their own caution
+scale (``feeding.caution_scale``), as ``Life(feeding=True)`` lives them. The diagnosis
+does not restart episodes: bodies go on past their episode end (``episode_steps_left``
+says where the life would have restarted each one).
+
+The arms (``arms``): how often each joint is within ``ARM_TOL`` of a limit, by energy
+band; each drive's weighted reward by posture (folded: 3 or 4 joints at a limit;
+partial; extended: none), with caution's share from the joints; whether the joint
+action saturates (``|a| > 0.95`` after the tanh, and the policy's mean) and whether it
+keeps pushing into a limit it is already at (with the effort lost there); and, sampled
+every ``REACH_EVERY`` steps, the fewest steps to put a limb tip on an active food with
+the trunk in place (joints only, and joints while turning in place; walls ignored).
+
+``diagnosis.record`` (a list of bodies, or ``zero``: every body that reaches 0) saves
+``signals_body<i>.npz`` in the viewer's format (``umbral.world.render.save_gif``, plus
+energy, E_int, actions, joints and drives) and ``body<i>.gif`` from 300 steps before its
+first step at 0.
+
 It changes nothing and stops nothing.
 """
 
@@ -40,6 +59,8 @@ from umbral.checkpoint import Checkpoint, load_checkpoint
 from umbral.config import Config
 from umbral.experiments.agent import load_agent
 from umbral.experiments.registry import register
+from umbral.metrics.behavior import _row_snapshot
+from umbral.mind.life import feeding_histories
 from umbral.mind.agent import GaussianNoise
 from umbral.mind.drives import Drives, hunger_reward, internal_energy_step, temperament_from_config
 from umbral.recorder import Recorder
@@ -58,12 +79,168 @@ def _angle(a: np.ndarray) -> np.ndarray:
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
+ARM_TOL = 0.1  # rad: a joint this close to one of its limits is "against the limit"
+JOINTS = ("left_q1", "left_q2", "right_q1", "right_q2")
+ARM_BANDS = {"zero": lambda e: e == 0.0, "below_0.05": lambda e: (e > 0) & (e < 0.05),
+             "0.05_0.2": lambda e: (e >= 0.05) & (e <= 0.2), "above_0.2": lambda e: e > 0.2}
+
+
+def _reach_steps(p, q_now, pos, heading, strength, fpos, fr, grid_q, tips_local, offsets):
+    """Fewest steps to put a limb tip on an active food with the trunk in place (joints only, and
+    joints while turning in place, in parallel), at the body's strength; walls are ignored.
+    Returns (joints_only, with_turning); None when no posture reaches any food."""
+    if not len(fpos):
+        return None, None
+    jstep, tstep = p.max_joint_speed * strength, p.max_turn * strength
+    best = [np.inf, np.inf]
+    for i in range(2):
+        js = np.abs(grid_q - q_now[i]).max(-1) / jstep  # (M,): joints move in parallel
+        for k, d in enumerate(offsets):
+            c, s = np.cos(heading + d), np.sin(heading + d)
+            tl = tips_local[:, i]
+            tw = pos + np.stack([c * tl[:, 0] - s * tl[:, 1], s * tl[:, 0] + c * tl[:, 1]], -1)
+            gap = np.linalg.norm(tw[:, None] - fpos[None], axis=-1) - fr[None] - p.limb_radius
+            ok = (gap <= 0).any(-1)
+            if ok.any():
+                n = float(np.ceil(max(js[ok].min(), abs(d) / tstep)))  # turning and joints at once
+                best[1] = min(best[1], n)
+                if d == 0.0:
+                    best[0] = min(best[0], float(np.ceil(js[ok].min())))
+    return (None if not np.isfinite(best[0]) else best[0]), (None if not np.isfinite(best[1]) else best[1])
+
+
+def _arms(p, env, energy, q, act, mu, executed, dq, w, gate, value, eaten, pos, heading, food_pos, food_on,
+          fatigue, log_std, caution_scale) -> dict[str, Any]:
+    """How the arms sit against their limits, what each drive gives there, whether the action saturates,
+    and how many steps the body would need to eat the food within its reach (docs/protocolo.md, 26 Nov 2026)."""
+    N, T = energy.shape
+    lo, hi = p.joint_lo[None, None, None], p.joint_hi[None, None, None]  # (1,1,1,2) over (T,N,limb,joint)
+    qq = q[:-1]
+    at_lo, at_hi = qq <= lo + ARM_TOL, qq >= hi - ARM_TOL
+    at = (at_lo | at_hi).transpose(1, 0, 2, 3).reshape(N, T, 4)  # (N,T,4) in action order
+    direction = (at_hi.astype(float) - at_lo.astype(float)).transpose(1, 0, 2, 3).reshape(N, T, 4)
+    n_at = at.sum(-1)
+    posture = {"folded": n_at >= 3, "partial": (n_at >= 1) & (n_at <= 2), "extended": n_at == 0}
+    tips = limb_points_b(p, pos[:-1].reshape(-1, 2), heading[:-1].reshape(-1), qq.reshape(-1, 2, 2))[:, :, 2]
+    fwd = ((tips - pos[:-1].reshape(-1, 1, 2)) * np.stack([np.cos(heading[:-1]), np.sin(heading[:-1])], -1)
+           .reshape(-1, 1, 2)).sum(-1).max(-1).reshape(T, N).T  # how far ahead of the trunk centre the farther tip is
+    aj, mj = act[..., 2:], np.tanh(mu[..., 2:])
+    caution_joints = -caution_scale * p.effort_cost * (aj ** 2).sum(-1) / 6.0
+    push = (aj * direction > 0.05) & at  # pushing into the limit it is already at
+    blocked = push & (np.abs(dq.transpose(1, 0, 2, 3).reshape(N, T, 4)) < 1e-9)
+    ex2 = executed ** 2
+    out: dict[str, Any] = {"tolerance_rad": ARM_TOL, "joint_lo": p.joint_lo.tolist(), "joint_hi": p.joint_hi.tolist(),
+                           "action_std": np.exp(log_std).tolist(), "by_energy": {}, "by_posture": {}}
+    for band, sel in ARM_BANDS.items():
+        m = sel(energy)
+        n = int(m.sum())
+        if not n:
+            out["by_energy"][band] = {"steps": 0}
+            continue
+        out["by_energy"][band] = {
+            "steps": n, **{f"{k}_fraction": float(v[m].mean()) for k, v in posture.items()},
+            "joints_at_limit_mean": float(n_at[m].mean()),
+            "at_limit_by_joint": {j: float(at[..., k][m].mean()) for k, j in enumerate(JOINTS)},
+            "tip_ahead_of_centre": float(fwd[m].mean())}
+    for name, sel in posture.items():
+        n = int(sel.sum())
+        if not n:
+            out["by_posture"][name] = {"steps": 0}
+            continue
+        f = (lambda a, s=sel: float(a[s].mean()))
+        z = sel & (energy == 0.0)
+        hi_e = sel & (energy > 0.2)
+        out["by_posture"][name] = {
+            "steps": n, "energy_mean": f(energy), "at_zero_fraction": float((energy[sel] == 0.0).mean()),
+            "hunger": f(w["hunger"]), "curiosity": f(w["curiosity"]), "caution": f(w["caution"]),
+            "caution_from_joints": f(caution_joints), "total": f(w["hunger"] + w["curiosity"] + w["caution"]),
+            "gate": f(gate), "value": f(value), "eats_per_1000_steps": float(eaten[sel].sum() / n * 1000),
+            "tip_ahead_of_centre": f(fwd),
+            "above_0.2": None if not hi_e.any() else {
+                "steps": int(hi_e.sum()), "hunger": float(w["hunger"][hi_e].mean()),
+                "curiosity": float(w["curiosity"][hi_e].mean()), "caution": float(w["caution"][hi_e].mean()),
+                "value": float(value[hi_e].mean())},
+            "at_zero": None if not z.any() else {
+                "steps": int(z.sum()), "hunger": float(w["hunger"][z].mean()),
+                "curiosity": float(w["curiosity"][z].mean()), "caution": float(w["caution"][z].mean()),
+                "value": float(value[z].mean())},
+            "joint_action_abs": float(np.abs(aj)[sel].mean()),
+            "joint_action_saturated_0.95": float((np.abs(aj) > 0.95)[sel].mean()),
+            "joint_mean_saturated_0.95": float((np.abs(mj) > 0.95)[sel].mean()),
+            "joint_mu_abs": float(np.abs(mu[..., 2:])[sel].mean())}
+    lim = at
+    out["at_limit"] = {
+        "joint_steps": int(lim.sum()),
+        "pushing_into_limit_fraction": float(push[lim].mean()) if lim.any() else None,
+        "mean_toward_limit": float((aj * direction)[lim].mean()) if lim.any() else None,
+        "mean_of_policy_toward_limit": float((mj * direction)[lim].mean()) if lim.any() else None,
+        "saturated_0.95_fraction": float((np.abs(aj) > 0.95)[lim].mean()) if lim.any() else None,
+        "policy_mean_saturated_0.95_fraction": float((np.abs(mj) > 0.95)[lim].mean()) if lim.any() else None,
+        "effort_lost_against_limits": float((ex2[..., 2:] * blocked).sum() / max(ex2.sum(), 1e-12)),
+        "effort_lost_against_limits_at_zero": float((ex2[..., 2:] * blocked)[energy == 0.0].sum()
+                                                    / max(ex2[energy == 0.0].sum(), 1e-12))}
+    fold = posture["folded"]
+    if fold.any():
+        codes, counts = np.unique(direction[fold].astype(int), axis=0, return_counts=True)
+        order = np.argsort(-counts)[:5]
+        out["by_posture"]["folded"]["patterns"] = [
+            {"limits": {j: {1: "hi", -1: "lo", 0: "-"}[int(c)] for j, c in zip(JOINTS, codes[i])},
+             "fraction": float(counts[i] / fold.sum())} for i in order]
+    out["saturation_all_steps"] = {"joint_action_0.95": float((np.abs(aj) > 0.95).mean()),
+                                   "joint_policy_mean_0.95": float((np.abs(mj) > 0.95).mean()),
+                                   "trunk_action_0.95": float((np.abs(act[..., :2]) > 0.95).mean())}
+
+    # steps to eat the food within reach: sampled every REACH_EVERY steps per body
+    g1 = np.linspace(p.joint_lo[0], p.joint_hi[0], 27)
+    g2 = np.linspace(p.joint_lo[1], p.joint_hi[1], 45)
+    grid_q = np.stack(np.meshgrid(g1, g2, indexing="ij"), -1).reshape(-1, 2)  # (M,2) one limb
+    M = len(grid_q)
+    tips_local = limb_points_b(p, np.zeros((M, 2)), np.zeros(M), np.stack([grid_q, grid_q], 1))[:, :, 2]
+    offsets = np.r_[0.0, np.linspace(-np.pi, np.pi, 37)[:-1]]
+    samples: dict[str, list[dict[str, Any]]] = {k: [] for k in posture}
+    for b in range(N):
+        for t in range(0, T, REACH_EVERY):
+            kind = next(k for k, v in posture.items() if v[b, t])
+            fo = food_on[t, b]
+            s = float(strength_b(p, energy[b, t:t + 1], fatigue[b, t:t + 1])[0])
+            j_only, turn = _reach_steps(p, q[t, b], pos[t, b], heading[t, b], s, food_pos[t, b][fo],
+                                        env.food_r[b][fo], grid_q, tips_local, offsets)
+            samples[kind].append({"body": b, "t": t, "energy": float(energy[b, t]), "joints_only": j_only,
+                                  "with_turning": turn})
+    reach: dict[str, Any] = {"sample_every": REACH_EVERY, "walls_ignored": True}
+    for k, ss in samples.items():
+        if not ss:
+            reach[k] = {"samples": 0}
+            continue
+        jo = np.array([x["joints_only"] for x in ss if x["joints_only"] is not None], float)
+        wt = np.array([x["with_turning"] for x in ss if x["with_turning"] is not None], float)
+        z = [x for x in ss if x["energy"] == 0.0]
+        reach[k] = {"samples": len(ss), "food_within_joints_reach": len(jo) / len(ss),
+                    "food_within_reach_turning_in_place": len(wt) / len(ss),
+                    "joints_only_steps_median": float(np.median(jo)) if len(jo) else None,
+                    "joints_only_steps_max": float(jo.max()) if len(jo) else None,
+                    "with_turning_steps_median": float(np.median(wt)) if len(wt) else None,
+                    "with_turning_steps_max": float(wt.max()) if len(wt) else None,
+                    "at_zero": {"samples": len(z), "within_reach_turning": sum(x["with_turning"] is not None for x in z),
+                                "with_turning_steps": sorted(x["with_turning"] for x in z
+                                                             if x["with_turning"] is not None)}}
+    out["reach_to_eat"] = reach
+    return out
+
+
+REACH_EVERY = 25
+
+
 @torch.no_grad()
-def diagnose(ck: Checkpoint, steps: int, limit: int, debt_floor: float = -1.0) -> dict[str, Any]:
+def diagnose(ck: Checkpoint, steps: int, limit: int, debt_floor: float = -1.0,
+             record: str | list[int] | None = None) -> dict[str, Any]:
     cfg = Config(ck.config)
     agent, _ = load_agent(ck)
     N = int(cfg.life.n_envs)
-    env = BatchedUmbralEnv(cfg, N, [str(cfg.agent.history)] * N)
+    extra = ck.extra or {}
+    feeding = extra.get("history") == "all"  # a checkpoint of the common feeding phase: the 4 histories mixed
+    histories = feeding_histories(cfg, N) if feeding else [str(cfg.agent.history)] * N
+    env = BatchedUmbralEnv(cfg, N, histories)
     ck.restore_env(env)
     p = env.params
     noise = GaussianNoise(N, [0] * N)
@@ -71,9 +248,11 @@ def diagnose(ck: Checkpoint, steps: int, limit: int, debt_floor: float = -1.0) -
     world = agent.world
     h = ck.mind_state["h"].clone()
     prev = ck.mind_state["prev_action"].numpy().astype(float)
-    extra = ck.extra or {}
     drives = Drives(env.layout, cfg.drives, temperament_from_config(cfg, extra.get("temperament", cfg.agent.temperament)),
                     p.effort_cost)
+    caution_scale = (cfg.get("feeding") or {}).get("caution_scale") if feeding else None
+    if caution_scale is not None:
+        drives.caution_scale = float(caution_scale)  # the childhood's own caution scale, as in Life(feeding=True)
     drives.set_state(extra["drives"])
     D, H, T = env.observation_dim, world.hidden_size, int(steps)
     obs = np.empty((N, T + 1, D))
@@ -95,10 +274,17 @@ def diagnose(ck: Checkpoint, steps: int, limit: int, debt_floor: float = -1.0) -
     has_debt = "e_int" in extra
     e_int = np.empty((N, T + 1))
     e_int[:, 0] = np.array(extra["e_int"], float) if has_debt else o[:, ei]
+    mu, executed = np.empty((N, T, 6)), np.empty((N, T, 6))
+    dq, fatigue = np.empty((T, N, 2, 2)), np.empty((N, T))
+    snaps: list[list[dict[str, np.ndarray]]] = [[_row_snapshot(env, r) for r in range(N)]]
     for t in range(T):
         h = world.step_hidden(torch.as_tensor(o, dtype=torch.float32), torch.as_tensor(prev, dtype=torch.float32), h)
+        mu[:, t] = agent.policy(h[0])[0].numpy()
+        fatigue[:, t] = env.fatigue
         a, _, _, v = agent.act(h[0], noise.sample())
         res, _, _, _, info = env.step(a)
+        executed[:, t], dq[t] = info["action_executed"], env.dq
+        snaps.append([_row_snapshot(env, r) for r in range(N)])
         o = res["flat"]
         hid[:, t], value[:, t] = h[0], v
         prv[:, t], act[:, t] = prev, info["action_intended"]
@@ -124,7 +310,11 @@ def diagnose(ck: Checkpoint, steps: int, limit: int, debt_floor: float = -1.0) -
     h_debt = hunger_reward(e_int[:, :-1], e_int[:, 1:], sp, hs)
 
     out: dict[str, Any] = {"checkpoint_step": ck.step, "temperament": drives.temperament.name,
-                           "history": str(cfg.agent.history), "metabolism": float(env.metabolism),
+                           "history": "all (feeding phase)" if feeding else str(cfg.agent.history),
+                           "histories_of_bodies": histories, "caution_scale": float(drives.caution_scale),
+                           "metabolism": float(env.metabolism),
+                           "episode_steps_left": [int(x) * int(cfg.life.rollout) for x in extra.get("life_left", [])],
+                           "episode_resets": "none in the diagnosis (bodies go on past their episode end)",
                            "steps": T, "bodies": N, "hunger_debt_in_config": drives.hunger_debt,
                            "debt_start": "checkpoint" if has_debt else "observed energy (no debt record)",
                            "debt_floor": float(debt_floor), "debt_min": float(e_int.min()),
@@ -160,7 +350,7 @@ def diagnose(ck: Checkpoint, steps: int, limit: int, debt_floor: float = -1.0) -
             fo = food_on[s, b]
             c = pos[s, b]
             if not fo.any():
-                bodies.append({"body": b, "start": s, "length": e - s, "active_food": 0})
+                bodies.append({"body": b, "history": histories[b], "start": s, "length": e - s, "active_food": 0})
                 continue
             d = np.linalg.norm(food_pos[s, b] - c, axis=-1)
             d = np.where(fo, d, np.inf)
@@ -172,7 +362,7 @@ def diagnose(ck: Checkpoint, steps: int, limit: int, debt_floor: float = -1.0) -
             d_end = float(np.linalg.norm(food_pos[s, b, j] - pos[e, b]))
             path = float(np.linalg.norm(np.diff(pos[s:e + 1, b], axis=0), axis=-1).sum())
             turned = float(np.abs(_angle(np.diff(heading[s:e + 1, b]))).sum())
-            bodies.append({"body": b, "start": s, "length": e - s, "ends_by": "window end" if e == T else "energy rose",
+            bodies.append({"body": b, "history": histories[b], "start": s, "length": e - s, "ends_by": "window end" if e == T else "energy rose",
                            "nearest_food": float(d[j]), "turn_needed_rad": ang, "straight_line_steps_needed": need,
                            "strength_at_zero": s0, "path": path, "net_approach": float(d[j]) - d_end,
                            "turned_rad": turned,
@@ -220,16 +410,57 @@ def diagnose(ck: Checkpoint, steps: int, limit: int, debt_floor: float = -1.0) -
                              "joint_actions_mean": act[b, s:e, 2:].mean(0).tolist(),
                              "moved": float(np.linalg.norm(pos[e, b] - pos[s, b]))})
     out["touching_food_without_eating"] = touching
+    out["arms"] = _arms(p, env, energy, q, act, mu, executed, dq, w, comps["gate"], value, eaten, pos, heading,
+                        food_pos, food_on, fatigue, agent.policy.log_std.detach().numpy(), float(drives.caution_scale))
+    out["bodies_reaching_zero"] = [int(b) for b in np.flatnonzero((energy == 0.0).any(-1))]
+    out["per_body"] = [{"body": b, "history": histories[b], "energy_min": float(energy[b].min()),
+                        "steps_at_zero": int((energy[b] == 0.0).sum()), "eaten": int(eaten[b].sum()),
+                        "e_int_min": float(e_int[b].min())} for b in range(N)]
+    rec = {}
+    for b in out["bodies_reaching_zero"] if record == "zero" else list(record or []):
+        b = int(b)
+        arena, r = env.row_arena(b), {}
+        for k in snaps[0][b]:
+            r[k] = np.stack([sn[b][k] for sn in snaps[1:]]).astype(bool if k == "food_active" else np.float32)
+        r.update(energy=energy[b].astype(np.float32), e_int=e_int[b, :-1].astype(np.float32),
+                 action_intended=act[b].astype(np.float32), action_mean=np.tanh(mu[b]).astype(np.float32),
+                 action_executed=executed[b].astype(np.float32), joints=q[:-1, b].astype(np.float32),
+                 hunger=w["hunger"][b].astype(np.float32), curiosity=w["curiosity"][b].astype(np.float32),
+                 caution=w["caution"][b].astype(np.float32), value=value[b].astype(np.float32),
+                 food_eaten=eaten[b].astype(np.int64), arena_size=np.float32(arena.size),
+                 trunk_radius=np.float32(p.trunk_radius), obstacle_pos=arena.obstacle_pos.astype(np.float32),
+                 obstacle_r=arena.obstacle_r.astype(np.float32), food_r=arena.food_r.astype(np.float32),
+                 neutral_r=np.r_[env.neutral_r[b, :int(env.neutral_on[b, :env.probe_slot].sum())],
+                                 float(cfg.world.neutral_radius)].astype(np.float32),
+                 history_id=np.array(histories[b]), body=np.int64(b))
+        rec[b] = r
+    out["_recordings"] = rec
     return out
 
 
 @register("zero_diagnosis")
 def run_zero_diagnosis(config: Config, recorder: Recorder, np_rng: np.random.Generator,
                        resume: Checkpoint | None) -> None:
+    from umbral.world.render import save_gif
+
     path = Path(str(config.diagnosis.checkpoint))
+    record = config.diagnosis.record
+    record = None if record is None else (str(record) if isinstance(record, str) else [int(x) for x in record])
     out = {"checkpoint": str(path), **diagnose(load_checkpoint(path), int(config.diagnosis.steps),
                                                 int(config.ethics.zero_run_limit or 200),
-                                                float(config.drives.debt_floor))}
+                                                float(config.drives.debt_floor), record)}
+    recs = out.pop("_recordings")
+    out["recordings"] = {}
+    for b, sig in recs.items():
+        np.savez_compressed(recorder.run_dir / f"signals_body{b}.npz", **sig)
+        z = np.flatnonzero(sig["energy"] == 0.0)
+        start = max(0, int(z[0]) - 300) if len(z) else 0
+        n = min(1200, len(sig["energy"]) - start)
+        clip = {k: (v[start:] if getattr(v, "ndim", 0) and len(v) == len(sig["energy"]) else v) for k, v in sig.items()}
+        save_gif(clip, recorder.run_dir / f"body{b}.gif", steps=n, stride=6, fps=15,
+                 title=f"h{sig['history_id']} body {b} · from step {start} ·")
+        out["recordings"][b] = {"signals": f"signals_body{b}.npz", "gif": f"body{b}.gif", "gif_from_step": start,
+                                "gif_steps": n}
     (recorder.run_dir / "diagnosis.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
     for band, v in out["bands"].items():
         recorder.log(f"{band}: " + "  ".join(f"{k} {x:.4g}" if isinstance(x, float) else f"{k} {x}"

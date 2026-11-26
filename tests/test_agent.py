@@ -11,7 +11,7 @@ from test_checkpoint_world import TINY
 from umbral.body.sensors import ObsLayout
 from umbral.checkpoint import load_checkpoint
 from umbral.cli import run_experiment
-from umbral.config import load_config
+from umbral.config import Config, load_config
 from umbral.experiments.agent import load_agent
 from umbral.mind.agent import Agent
 from umbral.mind.drives import (Drives, RewardScaler, Temperament, caution_reward, hunger_gate, hunger_reward,
@@ -717,3 +717,22 @@ def test_zero_diagnosis_reports_the_drives_at_energy_zero(tmp_path, infancy):
                                        "diagnosis.steps=40", "ethics.zero_run_limit=5", "run.name=zdiag2"))
     assert (again / "diagnosis.json").read_text(encoding="utf-8").replace(str(again), "") == \
         (d / "diagnosis.json").read_text(encoding="utf-8").replace(str(d), "")  # deterministic from the checkpoint
+    arms = r["arms"]
+    assert set(arms["by_energy"]) == {"zero", "below_0.05", "0.05_0.2", "above_0.2"}
+    assert {"pushing_into_limit_fraction", "effort_lost_against_limits"} <= set(arms["at_limit"])
+    assert sum(v["samples"] for v in arms["reach_to_eat"].values() if isinstance(v, dict) and "samples" in v) == 4 * 2
+    assert r["histories_of_bodies"] == ["0"] * 4 and r["bodies_reaching_zero"]
+
+
+def test_zero_diagnosis_of_the_feeding_phase_uses_its_mixed_histories_and_records(tmp_path, common_start, infancy):
+    ck = common_start / "checkpoints" / "common_start.pt"
+    d = run_experiment(life_config(tmp_path, infancy, "experiment=zero_diagnosis", f"diagnosis.checkpoint={ck.as_posix()}",
+                                   "diagnosis.steps=30", "diagnosis.record=[0,3]", "run.name=zdiag_feed"))
+    r = json.loads((d / "diagnosis.json").read_text(encoding="utf-8"))
+    assert r["histories_of_bodies"] == ["0", "1", "2", "3"] and r["history"].startswith("all")
+    cfg = Config(load_checkpoint(ck).config)
+    assert r["caution_scale"] == float(cfg.feeding.caution_scale)  # the childhood's own caution, as in its life
+    assert set(r["recordings"]) == {"0", "3"}
+    sig = np.load(d / "signals_body3.npz")
+    assert str(sig["history_id"]) == "3" and sig["trunk_pose"].shape == (30, 3) and sig["energy"].shape == (30,)
+    assert (d / "body3.gif").exists()

@@ -254,6 +254,7 @@ prediction:                     # experiment=prediction_own: the prediction erro
 diagnosis:                      # experiment=zero_diagnosis: drives and bodies at energy 0 (informative, no learning)
   checkpoint: null              # a life checkpoint (iter_*.pt, life_short.pt ...)
   steps: 1000                   # steps the policy runs on from it
+  record: null                  # bodies to record for the viewer (signals_body<i>.npz, body<i>.gif): a list, or zero (every body that reaches 0)
 
 replay:                         # experiment=battery_replay: battery episodes again, recorded (signals_ep<i>.npz)
   episodes: []                  # battery episode indices to record (behavior.checkpoint, behavior.history)
